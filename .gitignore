@@ -1,0 +1,4 @@
+data/*
+venv/*
+runs/*
+*/__pycache__/*
