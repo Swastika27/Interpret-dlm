@@ -53,9 +53,9 @@ awk -v L=$L '($3-$2)==L' test.w${L}.bed  > test.w${L}.full.bed
 
 6. Random subsample each split
 ```bash
-N_TRAIN=50000
-N_VAL=5000
-N_TEST=5000
+N_TRAIN=200000
+N_VAL=10000
+N_TEST=10000
 # For reproducibility
 SEED=42
 shuf --random-source=<(openssl enc -aes-256-ctr -pass pass:$SEED -nosalt </dev/zero 2>/dev/null) -n $N_TRAIN train.w${L}.full.bed > train.sub.bed
@@ -111,38 +111,32 @@ python training/extract_hyena_embeddings.py \
 --split train \
 --save_dir data/embeddings \
 --seq_len 2000 \
---layers 5 \
---batch_size 8 \
+--layers 8 \
+--batch_size 64 \
 --dtype_save float32
-```
 
-**6250 shards for 50k sequences**
-
-```bash
 python training/extract_hyena_embeddings.py \
 --fasta data/raw/GRCh38.primary_assembly.genome.fa \
 --bed data/preprocessed/val.sub.bed \
 --split val \
 --save_dir data/embeddings \
 --seq_len 2000 \
---layers 5 \
---batch_size 8 \
+--layers 8 \
+--batch_size 64 \
 --dtype_save float32
-```
 
-```bash
 python training/extract_hyena_embeddings.py \
 --fasta data/raw/GRCh38.primary_assembly.genome.fa \
 --bed data/preprocessed/test.sub.bed \
 --split test \
 --save_dir data/embeddings \
 --seq_len 2000 \
---layers 5 \
---batch_size 8 \
+--layers 8 \
+--batch_size 64 \
 --dtype_save float32
 ```
 
-train
+train ReLU SAE
 ```bash
 python training/train_sae_saved_embedding.py \
   --emb_root data/embeddings \
@@ -160,6 +154,22 @@ python training/train_sae_saved_embedding.py \
   --save_every 2000
   ```
 
+BatchTopK SAE
+```bash
+  python training/train_batchtopk.py \
+    --data_root data/embeddings \
+    --split_train train --split_val val \
+    --layer_dir_name layer_8 \
+    --d_in 256 --d_sae 8192 \
+    --batch_tokens 2048 --seq_len 2000 \
+    --k_per_token 8 \
+    --l1_coeff 1e-4 \
+    --lr 2e-4 --weight_decay 0.0 \
+    --max_steps 1000000 \
+    --log_every 500 --val_every 2000 --ckpt_every 5000 \
+    --out_dir runs/sae/layer8_bt8
+```
+
 normalize activations (using activation of validation set, interPLM style)
 ```bash
 python training/normalize_sae_val.py \
@@ -169,23 +179,37 @@ python training/normalize_sae_val.py \
     --device cuda --batch_tokens 8192
 ```
 
+### step 3: find feature-concept associations
 ```bash
 conda install conda-forge::intervaltree
 ```
 Search features
 ```bash
-python feature-concept-assoc/feature_search.py \
+python training/feature_search_farbg.py \
   --fasta data/raw/GRCh38.primary_assembly.genome.fa \
-  --promoter_bed data/annotations/gencode/promoter_TSS_1000up_100down.bed \
+  --feature_bed data/annotations/cpg/cpg_islands.hg38.bed \
   --sae_ckpt runs/sae/layer5_din256_dh8192_L2000_l10.001_bs256_seed42/ckpt_step_00020000.interplm_norm.pt \
+  --out_dir runs/cpg_search_perbase_farbg \
+  --model_id LongSafari/hyenadna-large-1m-seqlen-hf \
+  --layer 5 \
+  --seq_len 5000 \
+  --n_pos 100 --n_neg 100 \
+  --seed 42 \
+  --device cuda
+```
+
+python promoter_feature_search_perbase_farbg.py \
+  --fasta data/hg38.primary.fa \
+  --promoter_bed data/annotations/gencode/promoter_TSS_1000up_100down.bed \
+  --sae_ckpt runs/sae/<your_run>/ckpt_step_XXXXXXX.pt \
   --out_dir runs/promoter_feature_search \
   --model_id LongSafari/hyenadna-large-1m-seqlen-hf \
   --layer 5 \
   --seq_len 2000 \
   --n_pos 500 --n_neg 500 \
   --seed 42 \
-  --device cuda
-```
+  --device cuda \
+  --save_tensors
 
 ### step 3: Collect annotations + process them
 https://www.gencodegenes.org/human/
