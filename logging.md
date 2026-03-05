@@ -109,7 +109,7 @@ python training/extract_hyena_embeddings.py \
 --fasta data/raw/GRCh38.primary_assembly.genome.fa \
 --bed data/preprocessed/train.sub.bed \
 --split train \
---save_dir data/embeddings \
+--save_dir /media/system3/Transcend/data/embeddings \
 --seq_len 2000 \
 --layers 8 \
 --batch_size 64 \
@@ -161,12 +161,12 @@ BatchTopK SAE
     --split_train train --split_val val \
     --layer_dir_name layer_8 \
     --d_in 256 --d_sae 8192 \
-    --batch_tokens 2048 --seq_len 2000 \
+    --batch_tokens 512 --seq_len 2000 \
     --k_per_token 8 \
     --l1_coeff 1e-4 \
     --lr 2e-4 --weight_decay 0.0 \
-    --max_steps 1000000 \
-    --log_every 500 --val_every 2000 --ckpt_every 5000 \
+    --max_steps 2000 \
+    --log_every 1 --val_every 50 --ckpt_every 1000 \
     --out_dir runs/sae/layer8_bt8
 ```
 
@@ -179,7 +179,12 @@ python training/normalize_sae_val.py \
     --device cuda --batch_tokens 8192
 ```
 
-### step 3: find feature-concept associations
+### steeeeep33333: finnd feature firing information
+```bash
+python3 feature_activation_batchtopk.py
+```
+
+### step 4: find feature-concept associations
 ```bash
 conda install conda-forge::intervaltree
 ```
@@ -211,6 +216,66 @@ python promoter_feature_search_perbase_farbg.py \
   --device cuda \
   --save_tensors
 
+### step 4.1: find feature-concept association for batchtopk
+```bash
+python3 eval_concept_batchtopk.py \
+  --ckpt ../runs/sae/layer8_bt8/checkpoints/final.pt \
+  --data_root ../data/embeddings \
+  --split train \
+  --layer_dir_name layer_8 \
+  --seq_len 2000 \
+  --k_per_token 8 \
+  --n_tokens 1000000 \
+  --batch_tokens 256 \
+  --concept_bed ../data/annotations/encode_ccres/PLS.bed \
+  --out_csv ../runs/sae/layer8_bt8/pls_feature_assoc.csv
+```
+
+python3 eval_concept_batchtopk_stratified.py \
+  --ckpt ../runs/sae/layer8_bt8/checkpoints/final.pt \
+  --data_root ../data/embeddings \
+  --split train \
+  --layer_dir_name layer_8 \
+  --seq_len 2000 \
+  --k_per_token 8 \
+  --batch_tokens 512 \
+  --n_tokens 500 \
+  --concept_bed ../data/annotations/encode_ccres/PLS.bed \
+  --out_csv ../runs/sae/rresults/pls.csv \
+  --pos_frac_in_pool 0.5 \
+  --pos_frac_in_batch 0.1 \
+  --prevalence_max_windows 0
+
+python3 eval_concept_batchtopk_final.py \
+  --ckpt ../runs/sae/layer8_bt8/checkpoints/final.pt \
+  --data_root ../data/embeddings \
+  --split train \
+  --layer_dir_name layer_8 \
+  --seq_len 2000 \
+  --k_per_token 8 \
+  --batch_tokens 512 \
+  --concept_bed ../data/annotations/repeats/LINE.bed \
+  --n_tokens 500 \
+  --pos_frac_in_pool 0.5 \
+  --pos_frac_in_batch 0.1 \
+  --neg_mode background \
+  --index_path ../data/embeddings/train/indices/line.pt \
+  --out_csv ../runs/sae/layer8_bt8/rresults/line.csv \
+  --cache_emb 16
+
+### Summarize results
+python3 summarize_assoc.py \
+  --csv_glob "../runs/sae/layer8_bt8/rresults/*.csv" \
+  --top_examples_pt "../runs/sae/layer8_bt8/feature_top_examples.pt" \
+  --fasta "../data/raw/GRCh38.primary_assembly.genome.fa" \
+  --out_dir "../runs/sae/layer8_bt8/feat_assoc_summary/" \
+  --topk 10 \
+  --examples_per_feature 200 \
+  --radius 20 \
+  --center_k 9
+
+
+# background for exon, promoter, pathogenic | LINE
 ### step 3: Collect annotations + process them
 https://www.gencodegenes.org/human/
 region: CHR
@@ -316,5 +381,8 @@ hyenadna gives per tooooooooooooooooooooooken embeddings
 Iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii can proceed as in InteeeeeerPPPPLM
 
 
-cuda rebuild did not fix it. Actually, internal HyyyyyyyenaDNA calculationnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn expects fffffffffffp32, but GPT was casting  it to fp16 to save memory. Initializeeeed with fp32 and it worked (Is pytorch reinstallation responsible too? idkkkkkkkkkkkkkkkkkkkkkkk)
+cuda rebuild did not fix it. Actually, internal HyyyyyyyenaDNA calculation expects fp32, but GPT was casting  it to fp16 to save memory. Initializeeeed with fp32 and it worked (Is pytorch reinstallation responsible too? idk)
 
+
+
+**save shard indices**

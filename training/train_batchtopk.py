@@ -116,9 +116,11 @@ def list_shards(split_dir: str) -> List[str]:
 def build_sequence_index(layer_dir: str) -> Tuple[List[SeqRef], int]:
     """Returns (seq_refs, total_sequences). Loads each shard header to get emb.shape[0]."""
     shard_paths = list_shards(layer_dir)
+    print(f"Total shard count {len(shard_paths)}")
     seq_refs: List[SeqRef] = []
     total = 0
     for sp in shard_paths:
+        print(f"Building index for {sp}")
         obj = torch.load(sp, map_location="cpu")
         emb = obj["emb"]
         if emb.ndim != 3:
@@ -304,6 +306,17 @@ def write_csv_row(path: str, header: List[str], row: Dict[str, float]) -> None:
             w.writeheader()
         w.writerow({k: row.get(k, "") for k in header})
 
+# ---- ETA helpers (drop-in) -----------------------------------------------
+def format_seconds(s: float) -> str:
+    s = int(max(0, s))
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    if h > 0:
+        return f"{h}h {m:02d}m {sec:02d}s"
+    if m > 0:
+        return f"{m}m {sec:02d}s"
+    return f"{sec}s"
 
 # ----------------------------
 # Training
@@ -391,6 +404,8 @@ def main() -> None:
     best_val = float("inf")
 
     start_time = time.time()
+    last_log_time = start_time
+    step_times = []  # moving average of seconds/step over recent log intervals
     model.train()
 
     for step in range(1, args.max_steps + 1):
@@ -447,11 +462,24 @@ def main() -> None:
                 "mean_active": float(z_metrics["mean_active"].detach().cpu().item()),
             }
             write_csv_row(metrics_path, header, row)
+            now = time.time()
+            steps_left = args.max_steps - step
+
+            # seconds/step estimated over last log interval, smoothed over last 50 intervals
+            interval_sec_per_step = (now - last_log_time) / float(args.log_every)
+            last_log_time = now
+            step_times.append(interval_sec_per_step)
+            if len(step_times) > 50:
+                step_times.pop(0)
+
+            avg_sec_per_step = sum(step_times) / len(step_times)
+            eta_str = format_seconds(avg_sec_per_step * steps_left)
+
             print(
-                f"[train] step={step} seq_epochs={seq_epochs:.3f} "
+                f"[train] step={step}/{args.max_steps} seq_epochs={seq_epochs:.3f} "
                 f"recon={row['recon_mse']:.6g} l1={row['sparsity_l1']:.6g} "
                 f"loss={row['total_loss']:.6g} frac_nnz={row['frac_nnz']:.3g} "
-                f"mean_active={row['mean_active']:.3g}"
+                f"mean_active={row['mean_active']:.3g} ETA={eta_str}"
             )
 
         # Validation
