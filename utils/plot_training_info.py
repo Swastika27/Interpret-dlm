@@ -8,6 +8,9 @@ df = pd.read_csv("../runs/sae/layer8_bt8/metrics.csv")
 train_df = df[df["split"] == "train"]
 val_df = df[df["split"] == "val"]
 
+# train_df = train_df[-200:]
+# val_df = val_df[val_df["step"].isin(train_df["step"])]
+
 metrics = [
     ("recon_mse", "Reconstruction MSE"),
     ("sparsity_l1", "L1 Sparsity Loss"),

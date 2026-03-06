@@ -101,7 +101,7 @@ def make_token_batch_with_meta(seq_refs, cache, batch_seq_indices, seq_len, devi
 # Main
 # -----------------------------
 def main():
-    ckpt_path = "../runs/sae/layer8_bt8/checkpoints/final.pt"
+    ckpt_path = "../trained_models/layer8_bt8/checkpoints/final.pt"
     data_root = "../data/embeddings"
     split = "train"
     layer_dir_name = "layer_8"

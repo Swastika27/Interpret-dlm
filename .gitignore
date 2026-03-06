@@ -1,5 +1,6 @@
 data/*
 venv/*
-runs/*
+trained_models/*
 */__pycache__/*
 */*/__pycache__/*
+results/*

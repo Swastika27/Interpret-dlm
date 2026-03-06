@@ -1,4 +1,5 @@
-### step 1: Prepare data
+## step 1: Prepare data
+### Download and preprocess training data
 1. download GENCODE hg38 primary assembly
 
 ``` bash
@@ -63,220 +64,7 @@ shuf --random-source=<(openssl enc -aes-256-ctr -pass pass:$SEED -nosalt </dev/z
 shuf --random-source=<(openssl enc -aes-256-ctr -pass pass:$SEED -nosalt </dev/zero 2>/dev/null) -n $N_TEST test.w${L}.full.bed > test.sub.bed
 ```
 
-
-### step 2: Train SAE using DNABERT-2 embeddings
-
-Training only (no validation, no plots/CSV):
-
-```bash
-python training/train_sae.py \
---fasta data/training/GRCh38.primary_assembly.genome.fa \
---train_bed data/preprocessed/train_windows.bed \
---out ckpt/sae.pt \
---pool_windows 512 --tokens_per_window 16 \
---batch_tokens 2048
-```
-
-Training + validation + CSV + plots:
-
-```bash
-python training/train_sae.py \
---fasta data/training/GRCh38.primary_assembly.genome.fa \
---train_bed data/preprocessed/train_windows.bed \
---val_bed data/preprocessed/val_windows.bed \
---out ckpt/sae.pt \
---metrics_csv logs/metrics.csv \
---pool_windows 512 --tokens_per_window 16 \
---plot_png logs/loss_curves.png \
---val_every 500 --val_batches 10
-```
-
-To “lower correlation” more aggressively, modify two values:
-increase --pool_windows
-decrease --tokens_per_window
-
-1. DNABERT-2
-* create a new environment and install dependencies following instructions of their github repository
-* CONDA INSTALL BIOCONDA::PYFAIDX
-* DNABERT_2 DOES NOT RETURN HIDDEN_STATE OUTPUTS EVEN WHEN HIDDEN_STATE=TRUE, SO EXTRACT EMBEDDINGS USING HOOKS
-
-~~CURRENT CODE TAKES **MODEL_MAX_LENGTH=512** FROM CONFIG ~~-> fixed
-
-### step 2.1: Train SAE using Hyena embeddigns
-1. Extract embeddings **inside hyena docker container**
-```bash
-python training/extract_hyena_embeddings.py \
---fasta data/raw/GRCh38.primary_assembly.genome.fa \
---bed data/preprocessed/train.sub.bed \
---split train \
---save_dir /media/system3/Transcend/data/embeddings \
---seq_len 2000 \
---layers 8 \
---batch_size 64 \
---dtype_save float32
-
-python training/extract_hyena_embeddings.py \
---fasta data/raw/GRCh38.primary_assembly.genome.fa \
---bed data/preprocessed/val.sub.bed \
---split val \
---save_dir data/embeddings \
---seq_len 2000 \
---layers 8 \
---batch_size 64 \
---dtype_save float32
-
-python training/extract_hyena_embeddings.py \
---fasta data/raw/GRCh38.primary_assembly.genome.fa \
---bed data/preprocessed/test.sub.bed \
---split test \
---save_dir data/embeddings \
---seq_len 2000 \
---layers 8 \
---batch_size 64 \
---dtype_save float32
-```
-
-train ReLU SAE
-```bash
-python training/train_sae_saved_embedding.py \
-  --emb_root data/embeddings \
-  --layer 5 \
-  --seq_len 2000 \
-  --d_hidden 8192 \
-  --batch_size 256 \
-  --tokens_per_window 1 \
-  --l1_coeff 1e-3 \
-  --lr 3e-4 \
-  --steps 20000 \
-  --log_every 50 \
-  --eval_every 500 \
-  --eval_steps 50 \
-  --save_every 2000
-  ```
-
-BatchTopK SAE
-```bash
-  python training/train_batchtopk.py \
-    --data_root data/embeddings \
-    --split_train train --split_val val \
-    --layer_dir_name layer_8 \
-    --d_in 256 --d_sae 8192 \
-    --batch_tokens 512 --seq_len 2000 \
-    --k_per_token 8 \
-    --l1_coeff 1e-4 \
-    --lr 2e-4 --weight_decay 0.0 \
-    --max_steps 2000 \
-    --log_every 1 --val_every 50 --ckpt_every 1000 \
-    --out_dir runs/sae/layer8_bt8
-```
-
-normalize activations (using activation of validation set, interPLM style)
-```bash
-python training/normalize_sae_val.py \
-    --ckpt runs/sae/layer5_din256_dh8192_L2000_l10.001_bs256_seed42/ckpt_step_0020000.pt \
-    --val_layer_dir data/embeddings/val/layer_5 \
-    --out_ckpt runs/sae/layer5_din256_dh8192_L2000_l10.001_bs256_seed42/ckpt_step_00020000.interplm_norm.pt \
-    --device cuda --batch_tokens 8192
-```
-
-### steeeeep33333: finnd feature firing information
-```bash
-python3 feature_activation_batchtopk.py
-```
-
-### step 4: find feature-concept associations
-```bash
-conda install conda-forge::intervaltree
-```
-Search features
-```bash
-python training/feature_search_farbg.py \
-  --fasta data/raw/GRCh38.primary_assembly.genome.fa \
-  --feature_bed data/annotations/cpg/cpg_islands.hg38.bed \
-  --sae_ckpt runs/sae/layer5_din256_dh8192_L2000_l10.001_bs256_seed42/ckpt_step_00020000.interplm_norm.pt \
-  --out_dir runs/cpg_search_perbase_farbg \
-  --model_id LongSafari/hyenadna-large-1m-seqlen-hf \
-  --layer 5 \
-  --seq_len 5000 \
-  --n_pos 100 --n_neg 100 \
-  --seed 42 \
-  --device cuda
-```
-
-python promoter_feature_search_perbase_farbg.py \
-  --fasta data/hg38.primary.fa \
-  --promoter_bed data/annotations/gencode/promoter_TSS_1000up_100down.bed \
-  --sae_ckpt runs/sae/<your_run>/ckpt_step_XXXXXXX.pt \
-  --out_dir runs/promoter_feature_search \
-  --model_id LongSafari/hyenadna-large-1m-seqlen-hf \
-  --layer 5 \
-  --seq_len 2000 \
-  --n_pos 500 --n_neg 500 \
-  --seed 42 \
-  --device cuda \
-  --save_tensors
-
-### step 4.1: find feature-concept association for batchtopk
-```bash
-python3 eval_concept_batchtopk.py \
-  --ckpt ../runs/sae/layer8_bt8/checkpoints/final.pt \
-  --data_root ../data/embeddings \
-  --split train \
-  --layer_dir_name layer_8 \
-  --seq_len 2000 \
-  --k_per_token 8 \
-  --n_tokens 1000000 \
-  --batch_tokens 256 \
-  --concept_bed ../data/annotations/encode_ccres/PLS.bed \
-  --out_csv ../runs/sae/layer8_bt8/pls_feature_assoc.csv
-```
-
-python3 eval_concept_batchtopk_stratified.py \
-  --ckpt ../runs/sae/layer8_bt8/checkpoints/final.pt \
-  --data_root ../data/embeddings \
-  --split train \
-  --layer_dir_name layer_8 \
-  --seq_len 2000 \
-  --k_per_token 8 \
-  --batch_tokens 512 \
-  --n_tokens 500 \
-  --concept_bed ../data/annotations/encode_ccres/PLS.bed \
-  --out_csv ../runs/sae/rresults/pls.csv \
-  --pos_frac_in_pool 0.5 \
-  --pos_frac_in_batch 0.1 \
-  --prevalence_max_windows 0
-
-python3 eval_concept_batchtopk_final.py \
-  --ckpt ../runs/sae/layer8_bt8/checkpoints/final.pt \
-  --data_root ../data/embeddings \
-  --split train \
-  --layer_dir_name layer_8 \
-  --seq_len 2000 \
-  --k_per_token 8 \
-  --batch_tokens 512 \
-  --concept_bed ../data/annotations/repeats/LINE.bed \
-  --n_tokens 500 \
-  --pos_frac_in_pool 0.5 \
-  --pos_frac_in_batch 0.1 \
-  --neg_mode background \
-  --index_path ../data/embeddings/train/indices/line.pt \
-  --out_csv ../runs/sae/layer8_bt8/rresults/line.csv \
-  --cache_emb 16
-
-### Summarize results
-python3 summarize_assoc.py \
-  --csv_glob "../runs/sae/layer8_bt8/rresults/*.csv" \
-  --top_examples_pt "../runs/sae/layer8_bt8/feature_top_examples.pt" \
-  --fasta "../data/raw/GRCh38.primary_assembly.genome.fa" \
-  --out_dir "../runs/sae/layer8_bt8/feat_assoc_summary/" \
-  --topk 10 \
-  --examples_per_feature 200 \
-  --radius 20 \
-  --center_k 9
-
-
-# background for exon, promoter, pathogenic | LINE
-### step 3: Collect annotations + process them
+### download and preprocess annotation data
 https://www.gencodegenes.org/human/
 region: CHR
 ```bash
@@ -344,15 +132,12 @@ python data_utils/extract_clinvar_labels.py \
 --exclude_conflicting
 ```
 
-**don't forget "conda activate dna"!**
 
 **MOdel change to HyenaDNA**
 1. clone hyenadna repo
 2. pull docker image 
 3. run container
 ```bash
-
-
  docker run --gpus all -it  \
  --shm-size=16g \
  --name hyena  \
@@ -360,7 +145,7 @@ python data_utils/extract_clinvar_labels.py \
     hyenadna/hyena-dna     /bin/bash
 ```
 
-embeddiiiing extractiooonnnnnnnnnnnnnnnnnnnnn wwworks on cpu, the gpt scriiipt, not on gpuuu. GPT says itttttttttttttttttttttttttttttttttttttttttttttttttt will need   pytorch, cudaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa rebuild toooooo fix
+embedding extraction works on cpu, the gpt script, not on gpu. GPT says it will need   pytorch, cuda rebuild to fix
 
 root@0eb1763ec4ad:/wdr# cd ../workspace/code/test_fms/
 root@0eb1763ec4ad:/workspace/code/test_fms# pip uninstall -y torch torchvision torchaudio
@@ -374,15 +159,147 @@ Uninstalling torchvision-0.14.0:
 
 
 
-
-
-hyenadna gives per tooooooooooooooooooooooken embeddings
-
-Iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii can proceed as in InteeeeeerPPPPLM
-
-
-cuda rebuild did not fix it. Actually, internal HyyyyyyyenaDNA calculation expects fp32, but GPT was casting  it to fp16 to save memory. Initializeeeed with fp32 and it worked (Is pytorch reinstallation responsible too? idk)
+cuda rebuild did not fix it. Actually, internal HyenaDNA calculation expects fp32, but GPT was casting  it to fp16 to save memory. Initializeeeed with fp32 and it worked (Is pytorch reinstallation responsible too? idk)
 
 
 
-**save shard indices**
+### Download motif databases
+```bash
+# JASPAR
+mkdir -p motif_dbs
+cd motif_dbs
+
+wget https://jaspar.genereg.net/download/data/2024/CORE/JASPAR2024_CORE_vertebrates_non-redundant_pfms_meme.txt
+
+mv JASPAR2024_CORE_vertebrates_non-redundant_pfms_meme.txt jaspar.meme
+```
+
+```bash
+# Dfam repeat database
+wget https://www.dfam.org/releases/Dfam_3.8/families/Dfam_curatedonly.embl.gz
+
+# convert to meme format
+python convert_embl_to_meme.py \
+    --embl ../data/motif_dbs/Dfam_curatedonly.embl \
+    --out ../data/motif_dbs/dfam_curated.meme
+```
+
+
+## step 2: Train SAE using Hyena embeddigns
+1. Extract embeddings **inside hyena docker container**
+```bash
+# train split
+python main/extract_hyena_embeddings.py \
+--fasta data/raw/GRCh38.primary_assembly.genome.fa \
+--bed data/preprocessed/train.sub.bed \
+--split train \
+--save_dir data/embeddings \
+--seq_len 2000 \
+--layers 8 \
+--batch_size 64 \
+--dtype_save float32
+
+# val split
+python main/extract_hyena_embeddings.py \
+--fasta data/raw/GRCh38.primary_assembly.genome.fa \
+--bed data/preprocessed/val.sub.bed \
+--split val \
+--save_dir data/embeddings \
+--seq_len 2000 \
+--layers 8 \
+--batch_size 64 \
+--dtype_save float32
+
+# test split
+python main/extract_hyena_embeddings.py \
+--fasta data/raw/GRCh38.primary_assembly.genome.fa \
+--bed data/preprocessed/test.sub.bed \
+--split test \
+--save_dir data/embeddings \
+--seq_len 2000 \
+--layers 8 \
+--batch_size 64 \
+--dtype_save float32
+```
+
+train ReLU SAE
+```bash
+python main/train_sae_saved_embedding.py \
+  --emb_root data/embeddings \
+  --layer 5 \
+  --seq_len 2000 \
+  --d_hidden 8192 \
+  --batch_size 256 \
+  --tokens_per_window 1 \
+  --l1_coeff 1e-3 \
+  --lr 3e-4 \
+  --steps 20000 \
+  --log_every 50 \
+  --eval_every 500 \
+  --eval_steps 50 \
+  --save_every 2000
+  ```
+
+BatchTopK SAE
+```bash
+python main/train_batchtopk.py \
+  --data_root data/embeddings \
+  --split_train train --split_val val \
+  --layer_dir_name layer_8 \
+  --d_in 256 --d_sae 8192 \
+  --batch_tokens 512 --seq_len 2000 \
+  --k_per_token 8 \
+  --l1_coeff 1e-4 \
+  --lr 2e-4 --weight_decay 0.0 \
+  --max_steps 2000 \
+  --log_every 1 --val_every 50 --ckpt_every 1000 \
+  --out_dir trained_models/layer8_bt8
+```
+
+## step3: finnd feature firing information
+```bash
+python3 feature_activation_batchtopk.py
+```
+
+## step 5: find feature-concept association
+```bash
+python3 main/eval_concept_batchtopk_final.py \
+  --ckpt trained_models/layer8_bt8/checkpoints/final.pt \
+  --data_root data/embeddings \
+  --split train \
+  --layer_dir_name layer_8 \
+  --seq_len 2000 \
+  --k_per_token 8 \
+  --batch_tokens 512 \
+  --concept_bed data/annotations/repeats/LINE.bed \
+  --n_tokens 500 \
+  --pos_frac_in_pool 0.5 \
+  --pos_frac_in_batch 0.1 \
+  --neg_mode background \
+  --index_path data/embeddings/train/indices/line.pt \
+  --out_csv results/layer8_bt8/feat_assoc/line.csv \
+  --cache_emb 16
+```
+
+### step 6: Summarize results
+```bash
+python3 main/summarize_assoc.py \
+  --csv_glob "trained_models/layer8_bt8/feat_assoc/*.csv" \
+  --top_examples_pt "trained_models/layer8_bt8/feature_top_examples.pt" \
+  --fasta "data/raw/GRCh38.primary_assembly.genome.fa" \
+  --out_dir "results/layer8_bt8/feat_assoc_summary/" \
+  --topk 10 \
+  --examples_per_feature 200 \
+  --radius 20 \
+  --center_k 9
+```
+
+### step 7: find matching motifs from databases
+```bash
+python3 find_tomtom_matches.py \
+  --meme_glob "../runs/sae/layer8_bt8/feat_assoc_summary/pls.csv.motifs.meme" \
+  --jaspar_db "../data/motif_dbs/jaspar.meme" \
+  --repeat_db "../data/motif_dbs/dfam_curated.meme" \
+  --out_dir "../runs/sae/layer8_bt8/tomtom"
+```
+# background for exon, promoter, pathogenic | LINE
