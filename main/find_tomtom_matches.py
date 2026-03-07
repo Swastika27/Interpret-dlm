@@ -80,59 +80,46 @@ def parse_tomtom(tsv_file, topk=3):
     return best
 
 
-def write_summary(out_path, jaspar_hits, repeat_hits):
+def write_summary(out_path, hits):
 
-    features = set(jaspar_hits.keys()) | set(repeat_hits.keys())
+    features = set(hits.keys())
 
     with open(out_path, "w") as f:
 
         f.write(
             "feature\t"
-            "jaspar_match\tpvalue\tevalue\tqvalue\t"
-            "repeat_match\tpvalue\tevalue\tqvalue\n"
+            "match\tpvalue\tevalue\tqvalue\t"
         )
 
         for feat in sorted(features):
 
-            j = jaspar_hits.get(feat, [("", "", "", "")])[0]
-            r = repeat_hits.get(feat, [("", "", "", "")])[0]
+            j = hits.get(feat, [("", "", "", "")])[0]
 
             f.write(
                 f"{feat}\t"
                 f"{j[0]}\t{j[1]}\t{j[2]}\t{j[3]}\t"
-                f"{r[0]}\t{r[1]}\t{r[2]}\t{r[3]}\n"
             )
 
 
-def process_motif_file(meme_file, jaspar_db, repeat_db, out_root):
+def process_motif_file(meme_file, db, out_root):
 
     base = os.path.basename(meme_file)
 
-    tomtom_jaspar_dir = os.path.join(out_root, base + "_jaspar")
-    tomtom_repeat_dir = os.path.join(out_root, base + "_repeat")
+    tomtom_dir = os.path.join(out_root, f"{base}_{db}")
 
-    ensure_dir(tomtom_jaspar_dir)
-    ensure_dir(tomtom_repeat_dir)
+    ensure_dir(tomtom_dir)
 
-    print("Running TomTom vs JASPAR:", base)
+    print(f"Running TomTom vs {db}:", base)
 
-    run_tomtom(meme_file, jaspar_db, tomtom_jaspar_dir)
+    run_tomtom(meme_file, db, tomtom_dir)
 
-    print("Running TomTom vs Repeat DB:", base)
-
-    run_tomtom(meme_file, repeat_db, tomtom_repeat_dir)
-
-    jaspar_hits = parse_tomtom(
-        os.path.join(tomtom_jaspar_dir, "tomtom.tsv")
-    )
-
-    repeat_hits = parse_tomtom(
-        os.path.join(tomtom_repeat_dir, "tomtom.tsv")
+    hits = parse_tomtom(
+        os.path.join(tomtom_dir, "tomtom.tsv")
     )
 
     summary_file = os.path.join(out_root, base + ".top_matches.tsv")
 
-    write_summary(summary_file, jaspar_hits, repeat_hits)
+    write_summary(summary_file,hits)
 
     print("Wrote", summary_file)
 
@@ -142,8 +129,7 @@ def main():
     ap = argparse.ArgumentParser()
 
     ap.add_argument("--meme_glob", required=True)
-    ap.add_argument("--jaspar_db", required=True)
-    ap.add_argument("--repeat_db", required=True)
+    ap.add_argument("--db_path", required=True)
     ap.add_argument("--out_dir", required=True)
 
     args = ap.parse_args()
@@ -159,8 +145,7 @@ def main():
 
         process_motif_file(
             meme_file,
-            args.jaspar_db,
-            args.repeat_db,
+            args.db_path,
             args.out_dir,
         )
 

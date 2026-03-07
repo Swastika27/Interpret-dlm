@@ -278,10 +278,10 @@ python3 main/eval_concept_batchtopk_final.py \
   --neg_mode background \
   --index_path data/embeddings/train/indices/line.pt \
   --out_csv results/layer8_bt8/feat_assoc/line.csv \
-  --cache_emb 16
+  --cache_emb 64
 ```
 
-### step 6: Summarize results
+## step 6: Summarize results
 ```bash
 python3 main/summarize_assoc.py \
   --csv_glob "trained_models/layer8_bt8/feat_assoc/*.csv" \
@@ -294,12 +294,23 @@ python3 main/summarize_assoc.py \
   --center_k 9
 ```
 
-### step 7: find matching motifs from databases
+## step 5+6: run the evaluation script
+```bash
+chmod +x all_annot_feat_assoc.sh
+
+./all_annot_feat_assoc.sh
+```
+
+## step 7: find matching motifs from databases
 ```bash
 python3 find_tomtom_matches.py \
   --meme_glob "../runs/sae/layer8_bt8/feat_assoc_summary/pls.csv.motifs.meme" \
   --jaspar_db "../data/motif_dbs/jaspar.meme" \
+  --out_dir "../runs/sae/layer8_bt8/tomtom"
+
+python3 find_tomtom_matches.py \
+  --meme_glob "../runs/sae/layer8_bt8/feat_assoc_summary/pls.csv.motifs.meme" \
   --repeat_db "../data/motif_dbs/dfam_curated.meme" \
   --out_dir "../runs/sae/layer8_bt8/tomtom"
 ```
-# background for exon, promoter, pathogenic | LINE
+
