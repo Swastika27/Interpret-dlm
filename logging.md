@@ -36,7 +36,7 @@ python3 data_utils/make_windows.py \
 --seed 42
 ```
 
-5. Brak genome intervals ito fixed length windows (2k here)
+5. Break genome intervals ito fixed length windows (2k here)
 ```bash
 cd data/preprocessed
 conda install -c bioconda bedtools
@@ -141,25 +141,28 @@ python data_utils/extract_clinvar_labels.py \
  docker run --gpus all -it  \
  --shm-size=16g \
  --name hyena  \
-  -v /mnt/disk1/swastika/Interpretability:/workspace     \
+  -v /mnt/disk1/swastika/Interpret-dlm:/workspace     \
     hyenadna/hyena-dna     /bin/bash
 ```
 
 embedding extraction works on cpu, the gpt script, not on gpu. GPT says it will need   pytorch, cuda rebuild to fix
 
-root@0eb1763ec4ad:/wdr# cd ../workspace/code/test_fms/
-root@0eb1763ec4ad:/workspace/code/test_fms# pip uninstall -y torch torchvision torchaudio
-Found existing installation: torch 1.13.0
-Uninstalling torch-1.13.0:
-  Successfully uninstalled torch-1.13.0
-Found existing installation: torchvision 0.14.0
-Uninstalling torchvision-0.14.0:
-  Successfully uninstalled torchvision-0.14.0
+python - <<EOF
+import torch
+print(torch.__version__)
+print(torch.version.cuda)
+print(torch.cuda.get_device_name())
+EOF
+
+pip uninstall torch -y
+
+pip install torch==2.1.2 torchvision torchaudio \
+--index-url https://download.pytorch.org/whl/cu118
 
 
 
 
-cuda rebuild did not fix it. Actually, internal HyenaDNA calculation expects fp32, but GPT was casting  it to fp16 to save memory. Initializeeeed with fp32 and it worked (Is pytorch reinstallation responsible too? idk)
+cuda rebuild did not fix it. Actually, internal HyenaDNA calculation expects fp32, but GPT was casting  it to fp16 to save memory. Initializeeeed with fp32 and it worked (Is pytorch reinstallation responsible too? YES)
 
 
 
@@ -249,11 +252,11 @@ python main/train_batchtopk.py \
   --d_in 256 --d_sae 8192 \
   --batch_tokens 512 --seq_len 2000 \
   --k_per_token 8 \
-  --l1_coeff 1e-4 \
+  --l1_coeff 0.05 \
   --lr 2e-4 --weight_decay 0.0 \
-  --max_steps 2000 \
-  --log_every 1 --val_every 50 --ckpt_every 1000 \
-  --out_dir trained_models/layer8_bt8
+  --max_steps 4000 \
+  --log_every 10 --val_every 50 --ckpt_every 200 \
+  --out_dir trained_models/layer8_bt8_lr0.05
 ```
 
 ## step3: finnd feature firing information
