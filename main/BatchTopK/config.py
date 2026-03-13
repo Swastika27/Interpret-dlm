@@ -43,7 +43,6 @@ def get_default_cfg():
         "aux_penalty": 1/32,
 
         "bandwidth": 0.001,
-        "theta": 0
     }
     default_cfg = post_init_cfg(default_cfg)
     return default_cfg

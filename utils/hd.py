@@ -17,7 +17,7 @@ def main():
         torch_dtype=torch.float32,
     ).to(device).eval()
 
-    seq = "ACGT" * 2500  # 10kbp example (10000 nt)
+    seq = "ACGT" * 2500 
     inputs = tok(seq, return_tensors="pt", add_special_tokens=False)
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
@@ -49,6 +49,11 @@ def main():
     # shape: (num_layers_plus_embed, batch, hidden_dim)
     seq_emb_stack = torch.stack(seq_emb_by_layer, dim=0)
     print("seq_emb_stack:", tuple(seq_emb_stack.shape))
+
+    print(f"named modules: {list(model.named_children())}")
+    # print(f"model hyena: {model.hyena} ")
+    # print(f"backbone layers: {model.backbone.layers} ")
+    # print(f"submodules of hyena {list(model.hyena)}")
 
 if __name__ == "__main__":
     main()

@@ -360,6 +360,8 @@ class JumpReLUInferenceSAE(torch.nn.Module):
         self.b_dec = sae.b_dec
         self.theta = theta
 
+        self.dict_size = self.W_enc.shape[1]
+
     def forward(self, x):
 
         x_cent = x - self.b_dec

@@ -4,7 +4,7 @@ set  -e # stop on error
 
 seq_len=512
 seq_per_shard=1024
-layer=8
+layer=6
 
 N_TRAIN=200000
 N_VAL=10000

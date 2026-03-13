@@ -225,43 +225,54 @@ python main/extract_hyena_embeddings.py \
 --dtype_save float32
 ```
 
-train ReLU SAE
-```bash
-python main/train_sae_saved_embedding.py \
-  --emb_root data/embeddings \
-  --layer 5 \
-  --seq_len 2000 \
-  --d_hidden 8192 \
-  --batch_size 256 \
-  --tokens_per_window 1 \
-  --l1_coeff 1e-3 \
-  --lr 3e-4 \
-  --steps 20000 \
-  --log_every 50 \
-  --eval_every 500 \
-  --eval_steps 50 \
-  --save_every 2000
-  ```
+Modify main/BatchTopK/main.py file as needed 
+python main/BatchTopK/main.py
 
-BatchTopK SAE
+
+## step: Evaluate sae training
 ```bash
-python main/train_batchtopk.py \
-  --data_root data/embeddings \
-  --split_train train --split_val val \
-  --layer_dir_name layer_8 \
-  --d_in 256 --d_sae 8192 \
-  --batch_tokens 512 --seq_len 2000 \
-  --k_per_token 8 \
-  --l1_coeff 0.05 \
-  --lr 2e-4 --weight_decay 0.0 \
-  --max_steps 4000 \
-  --log_every 10 --val_every 50 --ckpt_every 200 \
-  --out_dir trained_models/layer8_bt8_lr0.05
+  # With pre-saved embeddings (val and test sets):
+  python main/evaluate_sae.py \
+      --sae_path trained_models/layer8_8192_batchtopk_32_0.0003/checkpoints/step_199999.pt \
+      --cfg_path trained_models/layer8_8192_batchtopk_32_0.0003/config.json \
+      --val_embeddings_path data/embeddings/val/layer_8 \
+      --test_embeddings_path data/embeddings/test/layer_8 \
+      --output_file results/layer8_8192_batchtopk_32_0.0003/eval_metrics.yaml \
+      --device cuda
+
+  # With fidelity evaluation (requires sequences + HyenaDNA checkpoint):
+  python main/evaluate_sae.py \
+      --sae_path trained_models/layer8_8192_batchtopk_32_0.0003/checkpoints/step_199999.pt \
+      --cfg_path trained_models/layer8_8192_batchtopk_32_0.0003/config.json \
+      --val_embeddings_path data/embeddings/val/layer_8 \
+      --test_embeddings_path data/embeddings/test/layer_8 \
+      --output_file results/layer8_8192_batchtopk_32_0.0003/eval_metrics.yaml \
+      --device cuda \
+      --val_bed_path data/preprocessed/val.w512.full.bed \
+      --test_bed_path data/preprocessed/test.w512.full.bed \
+      --genome_path data/raw/GRCh38.primary_assembly.genome.fa \
+      --hyenadna_checkpoint_path LongSafari/hyenadna-large-1m-seqlen-hf \
+      --fidelity_max_seq_len 512 \
+      --layer_idx 8 
 ```
-
 ## step3: finnd feature firing information
 ```bash
 python3 feature_activation_batchtopk.py
+```
+
+v2
+```bash
+python3 find_top_tokens_per_feature.py \
+    --sae_checkpoint trained_models/layer8_8192_batchtopk_32_0.0003/checkpoints/step_199999.pt \
+    --sae_cfg        trained_models/layer8_8192_batchtopk_32_0.0003/config.json \
+    --save_dir       data/embeddings \
+    --layer          8 \
+    --splits         train val test \
+    --top_n          200 \
+    --context_len    5 \
+    --out_dir        results/layer8_8192_batchtopk_32_0.0003/top_tokens \
+    --device         cuda \
+    --batch_size     2048
 ```
 
 ## step 5: find feature-concept association
@@ -283,6 +294,17 @@ python3 main/eval_concept_batchtopk_final.py \
   --out_csv results/layer8_bt8/feat_assoc/line.csv \
   --cache_emb 64
 ```
+
+python main/find_concept_assoc.py \
+    --sae_checkpoint trained_models/layer8_8192_batchtopk_32_0.0003/checkpoints/step_199999.pt\
+    --sae_cfg        trained_models/layer8_8192_batchtopk_32_0.0003/config.json \
+    --save_dir       data/embeddings \
+    --layer          8 \
+    --splits         train val test \
+    --bed_dir        all_annotations/ \
+    --out_dir        results/concept_analysis \
+    --top_k_features 10 \
+    --seed           42
 
 ## step 6: Summarize results
 ```bash

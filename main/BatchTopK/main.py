@@ -3,6 +3,7 @@ from training import train_sae_wo_model
 from sae import VanillaSAE, TopKSAE, BatchTopKSAE, JumpReLUSAE
 from activation_store import StreamingActivationsStore
 from config import get_default_cfg, post_init_cfg
+import json
 # from transformer_lens import HookedTransformer
 
 
@@ -37,3 +38,20 @@ cfg = post_init_cfg(cfg)
 activations_store = StreamingActivationsStore(cfg)
 print("Starting training")
 train_sae_wo_model(sae, activations_store, cfg)
+
+
+
+# sae cfg for future reference
+def make_json_serializable(obj):
+    if isinstance(obj, dict):
+        return {k: make_json_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [make_json_serializable(v) for v in obj]
+    elif hasattr(obj, "__str__") and "torch" in str(type(obj)):
+        return str(obj)
+    else:
+        return obj
+
+cfg_path = f"{cfg['run_dir']}/config.json"
+with open(cfg_path, "w") as f:
+    json.dump(make_json_serializable(cfg), f, indent=4)

@@ -4,3 +4,5 @@ trained_models/*
 */__pycache__/*
 */*/__pycache__/*
 results*/*
+all_annotations/*
+
