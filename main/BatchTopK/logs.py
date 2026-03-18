@@ -104,7 +104,7 @@ def save_checkpoint(wandb_run, sae, cfg, step):
 
 
 def save_checkpoint(sae, cfg, theta, step):
-    save_dir = f"{cfg['run_dir']}/checkpoints/step_{step}"
+    save_dir = f"{cfg['run_dir']}/checkpoints"
     os.makedirs(save_dir, exist_ok=True)
 
     # Save model state

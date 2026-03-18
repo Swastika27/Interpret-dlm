@@ -476,7 +476,7 @@ def load_hyenadna_model(checkpoint_path: str, device: str):
     cfg = AutoConfig.from_pretrained(checkpoint_path, trust_remote_code=True)
     tok = AutoTokenizer.from_pretrained(checkpoint_path, trust_remote_code=True)
 
-    model = AutoModel.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         checkpoint_path,
         config=cfg,
         trust_remote_code=True,
@@ -507,16 +507,8 @@ def get_hyenadna_layer_module(model, layer_idx: int):
     #         return obj[layer_idx]
     #     except (AttributeError, IndexError):
     #         continue
-    return model.backbone.layers[layer_idx]
+    return model.hyena.backbone.layers[layer_idx]
  
-    # Nothing matched — print the top-level attribute names to help diagnose
-    top_attrs = [n for n, _ in model.named_children()]
-    raise AttributeError(
-        f"Could not find a layers ModuleList on the model.\n"
-        f"Top-level children: {top_attrs}\n"
-        f"Try: print(model) and trace the path to the ModuleList, "
-        f"then add it to the attr_path list in get_hyenadna_layer_module()."
-    )
 
 
 def calculate_cross_entropy_causal(logits: torch.Tensor, tokens: torch.Tensor) -> float:
@@ -674,8 +666,8 @@ class HyenaDNAFidelityEvaluator:
             # SAE expects [n_tokens, d_model]; flatten, reconstruct, reshape
             h_flat = hidden.squeeze(0)                          # [seq_len, d_model]
             with torch.no_grad():
-                recon_flat = sae(h_flat, unnormalize=True)      # [seq_len, d_model]
-            recon_patch = recon_flat.unsqueeze(0)               # [1, seq_len, d_model]
+                recon, acts = sae(h_flat)      # [seq_len, d_model]
+            recon_patch = recon.unsqueeze(0)               # [1, seq_len, d_model]
 
             logits_sae, _ = run_hyenadna_with_patch(
                 self.model, tokens, self.layer_idx, patch_tensor=recon_patch, device=self.device
@@ -801,6 +793,9 @@ def evaluate_sae(
     ]
 
     for split_name, emb_dir, bed_path in split_configs:
+        if not emb_dir:
+            print(f"⚠️  No embeddings path provided for {split_name} split. Skipping.")
+            continue
         print("=" * 70)
         print(f"SPLIT: {split_name.upper()}")
         print("=" * 70)
@@ -820,29 +815,31 @@ def evaluate_sae(
         print(f"  Total tokens: {n_tokens:,}")
 
         # 1. Reconstruction
-        # print(f"\n--- 1. Reconstruction Quality ({split_name}) ---")
-        # recon_metrics = calculate_reconstruction_metrics(
-        #     sae, shard_paths, batch_size=eval_batch_size, device=device_str
-        # )
-        # results[split_name]["reconstruction"] = recon_metrics
-        # for k, v in recon_metrics.items():
-        #     print(f"  {k}: {v:.6f}")
+        print(f"\n--- 1. Reconstruction Quality ({split_name}) ---")
+        recon_metrics = calculate_reconstruction_metrics(
+            sae, shard_paths, batch_size=eval_batch_size, device=device_str
+        )
+        results[split_name]["reconstruction"] = recon_metrics
+        for k, v in recon_metrics.items():
+            print(f"  {k}: {v:.6f}")
 
-        # # 2. Sparsity
-        # print(f"\n--- 2. Sparsity ({split_name}) ---")
-        # sparsity_metrics = calculate_sparsity_metrics(
-        #     sae, shard_paths, batch_size=eval_batch_size, device=device_str
-        # )
-        # results[split_name]["sparsity"] = sparsity_metrics
-        # for k, v in sparsity_metrics.items():
-        #     fmt = f"{v:.2f}%" if ("pct" in k or "freq" in k) else str(v)
-        #     print(f"  {k}: {fmt}")
+        # 2. Sparsity
+        print(f"\n--- 2. Sparsity ({split_name}) ---")
+        sparsity_metrics = calculate_sparsity_metrics(
+            sae, shard_paths, batch_size=eval_batch_size, device=device_str
+        )
+        results[split_name]["sparsity"] = sparsity_metrics
+        for k, v in sparsity_metrics.items():
+            fmt = f"{v:.2f}%" if ("pct" in k or "freq" in k) else str(v)
+            print(f"  {k}: {fmt}")
 
-        genome = Fasta(genome_path, as_raw=True, sequence_always_upper=True)
+        
         # 3. Fidelity
         if run_fidelity:
             print(f"\n--- 3. Fidelity — Loss Recovered ({split_name}) ---")
             print("  Patching HyenaDNA activations with SAE reconstructions...")
+
+            genome = Fasta(genome_path, as_raw=True, sequence_always_upper=True)
 
             fidelity_eval = HyenaDNAFidelityEvaluator(
                 checkpoint_path=hyenadna_checkpoint_path,

@@ -141,7 +141,7 @@ python data_utils/extract_clinvar_labels.py \
  docker run --gpus all -it  \
  --shm-size=16g \
  --name hyena  \
-  -v /mnt/disk1/swastika/Interpret-dlm:/workspace     \
+  -v /:/workspace     \
     hyenadna/hyena-dna     /bin/bash
 ```
 
@@ -158,8 +158,6 @@ pip uninstall torch -y
 
 pip install torch==2.1.2 torchvision torchaudio \
 --index-url https://download.pytorch.org/whl/cu118
-
-
 
 
 cuda rebuild did not fix it. Actually, internal HyenaDNA calculation expects fp32, but GPT was casting  it to fp16 to save memory. Initializeeeed with fp32 and it worked (Is pytorch reinstallation responsible too? YES)
@@ -233,27 +231,27 @@ python main/BatchTopK/main.py
 ```bash
   # With pre-saved embeddings (val and test sets):
   python main/evaluate_sae.py \
-      --sae_path trained_models/layer8_8192_batchtopk_32_0.0003/checkpoints/step_199999.pt \
-      --cfg_path trained_models/layer8_8192_batchtopk_32_0.0003/config.json \
-      --val_embeddings_path data/embeddings/val/layer_8 \
-      --test_embeddings_path data/embeddings/test/layer_8 \
-      --output_file results/layer8_8192_batchtopk_32_0.0003/eval_metrics.yaml \
+      --sae_path trained_models/layer6_8192_batchtopk_32_0.0003/checkpoints/step_199999.pt \
+      --cfg_path trained_models/layer6_8192_batchtopk_32_0.0003/config.json \
+      --val_embeddings_path data/embeddings/val/layer_6 \
+      --test_embeddings_path data/embeddings/test/layer_6 \
+      --output_file results/layer6_8192_batchtopk_32_0.0003/eval_metrics.yaml \
       --device cuda
 
   # With fidelity evaluation (requires sequences + HyenaDNA checkpoint):
   python main/evaluate_sae.py \
-      --sae_path trained_models/layer8_8192_batchtopk_32_0.0003/checkpoints/step_199999.pt \
-      --cfg_path trained_models/layer8_8192_batchtopk_32_0.0003/config.json \
-      --val_embeddings_path data/embeddings/val/layer_8 \
-      --test_embeddings_path data/embeddings/test/layer_8 \
-      --output_file results/layer8_8192_batchtopk_32_0.0003/eval_metrics.yaml \
+      --sae_path trained_models/layer6_8192_batchtopk_32_0.0003/checkpoints/step_199999.pt \
+      --cfg_path trained_models/layer6_8192_batchtopk_32_0.0003/config.json \
+      --val_embeddings_path data/embeddings/val/layer_6 \
+      --test_embeddings_path data/embeddings/test/layer_6 \
+      --output_file results/layer6_8192_batchtopk_32_0.0003/eval_metrics.yaml \
       --device cuda \
-      --val_bed_path data/preprocessed/val.w512.full.bed \
-      --test_bed_path data/preprocessed/test.w512.full.bed \
+      --val_bed_path data/preprocessed/val.sub.bed \
+      --test_bed_path data/preprocessed/test.sub.bed \
       --genome_path data/raw/GRCh38.primary_assembly.genome.fa \
       --hyenadna_checkpoint_path LongSafari/hyenadna-large-1m-seqlen-hf \
       --fidelity_max_seq_len 512 \
-      --layer_idx 8 
+      --layer_idx 5
 ```
 ## step3: finnd feature firing information
 ```bash
@@ -305,6 +303,15 @@ python main/find_concept_assoc.py \
     --out_dir        results/concept_analysis \
     --top_k_features 10 \
     --seed           42
+```
+
+v2 -> find out what concept top-activating tokens fall into
+```bash
+python main/annotate_top_activations.py \
+        --top_activations  results/$model_basename/top_activations/top_activations.pt \
+        --bed_dir          all_annotations \
+        --out_dir          results/$model_basename/feature_annotation_assoc
+```
 
 ## step 6: Summarize results
 ```bash

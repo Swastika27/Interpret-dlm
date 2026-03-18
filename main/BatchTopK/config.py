@@ -48,6 +48,6 @@ def get_default_cfg():
     return default_cfg
 
 def post_init_cfg(cfg):
-    cfg["name"] = f"layer8_{cfg['dict_size']}_{cfg['sae_type']}_{cfg['top_k']}_{cfg['lr']}"
+    cfg["name"] = f"layer6_{cfg['dict_size']}_{cfg['sae_type']}_{cfg['top_k']}_{cfg['lr']}"
     cfg["run_dir"] = f"trained_models/{cfg['name']}"
     return cfg
