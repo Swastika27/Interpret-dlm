@@ -183,11 +183,11 @@ class BEDIndex:
 
 def load_sae(cfg: dict, checkpoint_path: str, device: str):
     state     = torch.load(checkpoint_path, map_location=device)
-    sae_state = state.get("sae_state_dict") or state.get("model_state_dict") or state
+    sae_state = state.get("state_dict") or state.get("model_state_dict") or state
     saved_cfg = state.get("cfg", cfg)
     theta     = state.get("theta") or saved_cfg.get("theta")
 
-    arch    = cfg.get("architecture", "batchtopk").lower()
+    arch    = cfg.get("sae_type", "batchtopk").lower()
     cls_map = {
         "batchtopk": BatchTopKSAE,
         "top_k":     TopKSAE,

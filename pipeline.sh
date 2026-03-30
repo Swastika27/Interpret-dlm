@@ -31,10 +31,9 @@ num_train_tokens=$(($N_TRAIN * $seq_len))
 
 eval "$(conda shell.bash hook)"
 conda activate interpret
-cd data/preprocessed
+
 # remove blacklist regions and centromere regions from primary assembly. these regions are highly repetitive but not biologically regulatory regions.
 
-```bash
 python3 data_utils/make_windows.py \
 --fasta data/training/GRCh38.primary_assembly.genome.fa \
 --out_dir data/preprocessed \
@@ -44,7 +43,7 @@ python3 data_utils/make_windows.py \
 --blacklist_bed data/training/hg38-blacklist.v2.bed \
 --centromere_bed data/training/hg38_centromeres.bed \
 --seed $SEED
-```
+
 
 echo "Total windows after removing blacklist and centromere regions:"
 wc -l train.bed
@@ -119,7 +118,7 @@ python main/BatchTopK/main.py \
     --checkpoint_freq $checkpoint_freq \
 
 # after training, delete training embeddings to save space (optional)
-rm -rf data/embeddings/train/layer_${layer}
+# rm -rf data/embeddings/train/layer_${layer}
 
 
 disk2_embed_dir=/workspace/mnt/disk2/2005027/data/embeddings
@@ -156,7 +155,7 @@ docker exec $CONTAINER_NAME bash -c "
       --val_embeddings_path $docker_base/$disk2_embed_dir/val/layer_${layer} \
       --test_embeddings_path $disk2_embed_dir/test/layer_${layer} \
       --output_file "results/$model_basename/eval_metrics.yaml" \
-      --device cuda \
+      --device_str cuda \
       --val_bed_path data/preprocessed/val.sub.bed \
       --test_bed_path data/preprocessed/test.sub.bed \
       --genome_path data/raw/GRCh38.primary_assembly.genome.fa \
@@ -166,8 +165,8 @@ docker exec $CONTAINER_NAME bash -c "
       "
 
 # find top firing tokens per feature
-python find_top_activations.py \
-        --sae_checkpoint  rtrained_models/$model_basename/checkpoints/step_$(($N_TRAIN - 1)).pt \
+python main/find_top_activations.py \
+        --sae_checkpoint  trained_models/$model_basename/checkpoints/step_$(($N_TRAIN - 1)).pt \
         --sae_cfg         trained_models/$model_basename/config.json \
         --embed_dir       $disk2_embed_dir \
         --layer           $layer \

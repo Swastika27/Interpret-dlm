@@ -23,7 +23,7 @@ def load_sae(cfg: dict, checkpoint_path: str, device: str):
     print(cfg.keys())
 
     # Unwrap nested checkpoint formats
-    sae_state = state.get("sae_state_dict") or state.get("model_state_dict") or state
+    sae_state = state.get("state_dict") or state.get("model_state_dict") or state
     saved_cfg  = state.get("cfg", cfg)       # checkpoint may carry its own cfg
     theta      = state.get("theta") or saved_cfg.get("theta")
 

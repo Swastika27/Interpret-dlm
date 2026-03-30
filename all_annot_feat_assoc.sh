@@ -46,7 +46,7 @@ fi
 find "$annotation_dir" -type f -name "*.bed" | while read -r annotation_file; do
     
     filename=$(basename "$annotation_file" .bed)
-    if [ ! -f "$output_root/feat_assoc/$split_$filename.csv" ]; then
+    if [ ! -f "$output_root/feat_assoc/${split}_${filename}.csv" ]; then
         echo "Processing annotation file: $annotation_file"
 
         python3 main/eval_concept_batchtopk_final.py \
