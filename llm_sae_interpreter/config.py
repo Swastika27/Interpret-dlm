@@ -8,17 +8,18 @@ from pathlib import Path
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
-BASE_DIR = Path(__file__).parent
+BASE_DIR = Path("/mnt/disk1/swastika/Interpret-dlm")
+MODEL_TO_ANALYZE = "layer6_16384_batchtopk_32_0.0003"
 
 # Input files
-TOP_ACTIVATIONS_CSV = BASE_DIR / "top_activations.csv"
-ENRICHMENT_CSV      = BASE_DIR / "enrichment.csv"
+TOP_ACTIVATIONS_CSV = BASE_DIR / "results" / MODEL_TO_ANALYZE / "top_activations" / "top_activations.csv"
+ENRICHMENT_CSV      = BASE_DIR / "results" / MODEL_TO_ANALYZE / "feature_annotation_assoc" / "enrichment.csv"
 
 # Reference genome (hg38 FASTA, must be indexed by pyfaidx)
-GENOME_FASTA = Path("/path/to/hg38.fa")   # <-- UPDATE THIS
+GENOME_FASTA = BASE_DIR / "data" / "raw" / "GRCh38.primary_assembly.genome.fa"
 
 # Output directory
-OUTPUT_DIR = BASE_DIR / "output"
+OUTPUT_DIR = BASE_DIR / "results" / MODEL_TO_ANALYZE / "claude_analysis"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 # Per-step outputs
