@@ -28,6 +28,33 @@ def load_top_activations(pt_path: str):
     data = torch.load(pt_path, map_location="cpu")
     return data["coords"], data["act_values"]
 
+import re
+
+def normalise_chrom_convention(bed: pybedtools.BedTool) -> pybedtools.BedTool:
+    """
+    Detect whether the majority of intervals use 'chr' prefix and
+    normalise all intervals to match, then re-sort.
+    """
+    intervals = list(bed)
+    if not intervals:
+        return bed
+
+    n_chr    = sum(1 for i in intervals if i.chrom.startswith("chr"))
+    n_nochr  = len(intervals) - n_chr
+    use_chr  = n_chr >= n_nochr   # majority convention wins
+
+    lines = []
+    for i in intervals:
+        chrom = i.chrom
+        if use_chr and not chrom.startswith("chr"):
+            chrom = "chr" + chrom
+        elif not use_chr and chrom.startswith("chr"):
+            chrom = chrom[len("chr"):]
+        # Rebuild the line preserving all other fields
+        fields = [chrom] + list(i.fields[1:])
+        lines.append("\t".join(fields))
+
+    return pybedtools.BedTool("\n".join(lines) + "\n", from_string=True).sort()
 
 def build_all_tokens_bed(coords: list) -> pybedtools.BedTool:
     """
@@ -234,6 +261,29 @@ def main():
     all_tokens_bed = build_all_tokens_bed(coords)
     print(f"  {len(all_tokens_bed)} total token intervals across {n_features} features")
 
+    # Detect convention from token bed (your data is the reference)
+    sample = next(iter(all_tokens_bed))
+    tokens_use_chr = sample.chrom.startswith("chr")
+
+    def normalise_to(bed: pybedtools.BedTool, use_chr: bool) -> pybedtools.BedTool:
+        intervals = list(bed)
+        if not intervals:
+            return bed
+        lines = []
+        for i in intervals:
+            chrom = i.chrom
+            if use_chr and not chrom.startswith("chr"):
+                chrom = "chr" + chrom
+            elif not use_chr and chrom.startswith("chr"):
+                chrom = chrom[len("chr"):]
+            lines.append("\t".join([chrom] + list(i.fields[1:])))
+        return pybedtools.BedTool("\n".join(lines) + "\n", from_string=True).sort()
+
+    # Apply when loading concept BEDs
+    concept_beds: dict[str, pybedtools.BedTool] = {
+        bp.stem: normalise_to(pybedtools.BedTool(str(bp)).sort(), tokens_use_chr)
+        for bp in bed_paths
+    }
     # One intersect per concept
     print("Intersecting with concept BEDs ...")
     per_concept_hits: dict[str, list[int]] = {}

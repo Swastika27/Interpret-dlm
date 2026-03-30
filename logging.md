@@ -293,16 +293,19 @@ python3 main/eval_concept_batchtopk_final.py \
   --cache_emb 64
 ```
 
-python main/find_concept_assoc.py \
-    --sae_checkpoint trained_models/layer8_8192_batchtopk_32_0.0003/checkpoints/step_199999.pt\
-    --sae_cfg        trained_models/layer8_8192_batchtopk_32_0.0003/config.json \
-    --save_dir       data/embeddings \
-    --layer          8 \
-    --splits         train val test \
-    --bed_dir        all_annotations/ \
-    --out_dir        results/concept_analysis \
-    --top_k_features 10 \
-    --seed           42
+```bash
+python concept_feature_analysis.py \
+        --sae_checkpoint  runs/my_run/checkpoint_step10000.pt \
+        --sae_cfg         runs/my_run/cfg.json \
+        --save_dir        /data/embeddings \
+        --layer           2 \
+        --splits          train val test \
+        --bed_dir         concepts/ \
+        --out_dir         results/concept_analysis \
+        --device          cuda \
+        --batch_size      2048 \
+        --top_k_features  10 \
+        --seed            42
 ```
 
 v2 -> find out what concept top-activating tokens fall into

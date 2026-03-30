@@ -97,10 +97,22 @@ conda activate interpret
 #         --num_workers     4
 
 
-# find feature to concept association
-# for bed_dir in "clinvar" "cpg" "encode_ccres" "gencode" "repeats"; do
-python main/annotate_top_activations.py \
-        --top_activations  results/$model_basename/top_activations/top_activations.pt \
-        --bed_dir          all_annotations \
-        --out_dir          results/$model_basename/feature_annotation_assoc
-# done
+# # find feature to concept association
+# python main/annotate_top_activations.py \
+#         --top_activations  results/$model_basename/top_activations/top_activations.pt \
+#         --bed_dir          all_annotations \
+#         --out_dir          results/$model_basename/feature_annotation_assoc
+
+echo "running concept -> feature analysis for $model_basename"
+python main/concept_feature_analysis.py \
+        --sae_checkpoint  trained_models/$model_basename/checkpoints/step_$(($N_TRAIN - 1)).pt \
+        --sae_cfg         trained_models/$model_basename/config.json \
+        --save_dir        $disk2_embed_dir \
+        --layer           $layer \
+        --splits          val \
+        --bed_dir         all_annotations/ \
+        --out_dir         results/$model_basename/concept_analysis \
+        --device          cuda \
+        --batch_size      1024 \
+        --top_k_features  10 \
+        --seed            $SEED
