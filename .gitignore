@@ -6,5 +6,5 @@ trained_models/*
 results*/*
 all_annotations/*
 test_annotations/*
-
+.env
 

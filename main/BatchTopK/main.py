@@ -1,7 +1,7 @@
 #%%
 import argparse
 from training import train_sae_wo_model
-from sae import VanillaSAE, TopKSAE, BatchTopKSAE, JumpReLUSAE
+from sae import VanillaSAE, TopKSAE, BatchTopKSAE, JumpReLUSAE, GatedSAE
 from activation_store import StreamingActivationsStore
 from config import get_default_cfg, post_init_cfg
 import json
@@ -10,7 +10,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train a Sparse Autoencoder (SAE)")
 
     parser.add_argument("--sae_type", type=str, default="batchtopk",
-                        choices=["vanilla", "topk", "batchtopk", "jumprelu"],
+                        choices=["vanilla", "topk", "batchtopk", "jumprelu", "gated"],
                         help="Type of SAE to train")
     parser.add_argument("--layer", type=int, default=6,
                         help="Layer index to train on")
@@ -33,7 +33,9 @@ def parse_args():
     parser.add_argument("--wandb_project", type=str, default="Interpret-dlm",
                         help="Weights & Biases project name")
     parser.add_argument("--l1_coeff", type=float, default=0.0,
-                        help="L1 regularization coefficient")
+                        help="L1 regularization coefficient (gated: gate-path L1 scale)")
+    parser.add_argument("--gated_aux_coeff", type=float, default=1.0,
+                        help="Auxiliary reconstruction loss coefficient (gated SAE only)")
     parser.add_argument("--act_size", type=int, default=256,
                         help="Activation size (input dimensionality)")
     parser.add_argument("--device", type=str, default="cuda",
@@ -77,6 +79,7 @@ def main():
     cfg["dict_size"]       = args.dict_size
     cfg["wandb_project"]   = args.wandb_project
     cfg["l1_coeff"]        = args.l1_coeff
+    cfg["gated_aux_coeff"] = args.gated_aux_coeff
     cfg["act_size"]        = args.act_size
     cfg["device"]          = args.device
     cfg["bandwidth"]       = args.bandwidth
@@ -88,6 +91,7 @@ def main():
         "topk":      TopKSAE,
         "batchtopk": BatchTopKSAE,
         "jumprelu":  JumpReLUSAE,
+        "gated":     GatedSAE,
     }
     sae = SAE_CLASSES[cfg["sae_type"]](cfg)
     print("Created SAE")

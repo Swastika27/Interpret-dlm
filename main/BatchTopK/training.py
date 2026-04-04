@@ -3,7 +3,7 @@ import tqdm
 from logs import init_wandb, log_wandb, log_model_performance, save_checkpoint
 import os
 import csv
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 def write_csv_row(path: str, header: List[str], row: Dict[str, float]) -> None:
     exists = os.path.exists(path)
@@ -12,6 +12,19 @@ def write_csv_row(path: str, header: List[str], row: Dict[str, float]) -> None:
         if not exists:
             w.writeheader()
         w.writerow({k: row.get(k, "") for k in header})
+
+
+def _theta_for_checkpoint(sae, cfg) -> Optional[float]:
+    """BatchTopK tracks a JumpReLU threshold; other SAE types omit theta."""
+    if cfg.get("sae_type", "").lower() != "batchtopk":
+        cfg.pop("theta", None)
+        return None
+    if not hasattr(sae, "theta_count") or sae.theta_count == 0:
+        return None
+    theta = (sae.theta_sum / sae.theta_count).item()
+    cfg["theta"] = theta
+    return theta
+
 
 def train_sae_wo_model(sae, activation_store, cfg):
     num_batches = cfg["num_tokens"] // cfg["batch_size"]
@@ -51,8 +64,7 @@ def train_sae_wo_model(sae, activation_store, cfg):
             write_csv_row(log_path, header, row)
 
         if i % cfg["checkpoint_freq"] == 0:
-            theta = (sae.theta_sum / sae.theta_count).item()
-            cfg["theta"] = theta
+            theta = _theta_for_checkpoint(sae, cfg)
             save_checkpoint(sae, cfg, theta, i)
 
         
@@ -63,8 +75,7 @@ def train_sae_wo_model(sae, activation_store, cfg):
         optimizer.step()
         optimizer.zero_grad()
 
-    theta = (sae.theta_sum / sae.theta_count).item()
-    cfg["theta"] = theta
+    theta = _theta_for_checkpoint(sae, cfg)
     save_checkpoint(sae, cfg, theta, i)
 
 

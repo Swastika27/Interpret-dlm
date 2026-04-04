@@ -107,7 +107,13 @@ fi
 
 
 model_basename="layer${layer}_${dict_size}_batchtopk_${top_k}_${lr}"
-# train SAE on training embeddings
+
+# Gated SAE alternative: set l1_coeff_gated / gated_aux_coeff and use model_basename_gated in eval paths below.
+# l1_coeff_gated=0.01
+# gated_aux_coeff=1.0
+# model_basename_gated="layer${layer}_${dict_size}_gated_l1${l1_coeff_gated}_aux${gated_aux_coeff}_${lr}"
+
+# train SAE on training embeddings (BatchTopK)
 python main/BatchTopK/main.py \
     --layer $layer \
     --num_tokens $num_train_tokens \
@@ -116,6 +122,18 @@ python main/BatchTopK/main.py \
     --batch_size $batch_size \
     --perf_log_freq $perf_log_freq \
     --checkpoint_freq $checkpoint_freq \
+
+# Gated SAE training example (uncomment to run instead of BatchTopK; comment out the block above):
+# python main/BatchTopK/main.py \
+#     --sae_type gated \
+#     --layer $layer \
+#     --num_tokens $num_train_tokens \
+#     --dict_size $dict_size \
+#     --batch_size $batch_size \
+#     --l1_coeff $l1_coeff_gated \
+#     --gated_aux_coeff $gated_aux_coeff \
+#     --perf_log_freq $perf_log_freq \
+#     --checkpoint_freq $checkpoint_freq \
 
 # after training, delete training embeddings to save space (optional)
 # rm -rf data/embeddings/train/layer_${layer}
@@ -172,7 +190,6 @@ python main/find_top_activations.py \
         --layer           $layer \
         --splits          val test \
         --top_n           200 \
-        --context_len     5 \
         --out_dir         results/top_activations \
         --device          cuda \
         --batch_size      4096 \

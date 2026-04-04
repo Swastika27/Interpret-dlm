@@ -350,6 +350,119 @@ class JumpReLUSAE(BaseAutoencoder):
         return output
 
 
+class GatedSAE(nn.Module):
+    """
+    Gated sparse autoencoder (encoder: hard gate on pre-activation + magnitude path).
+    Matches the loss structure of sae_lens GatedTrainingSAE (main MSE + L1 on relu(pi_gate)
+    weighted by decoder row norms + auxiliary reconstruction from the gating path only).
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        torch.manual_seed(self.cfg["seed"])
+
+        self.b_dec = nn.Parameter(torch.zeros(self.cfg["act_size"]))
+        self.W_enc = nn.Parameter(
+            torch.nn.init.kaiming_uniform_(
+                torch.empty(self.cfg["act_size"], self.cfg["dict_size"])
+            )
+        )
+        self.W_dec = nn.Parameter(
+            torch.nn.init.kaiming_uniform_(
+                torch.empty(self.cfg["dict_size"], self.cfg["act_size"])
+            )
+        )
+        self.W_dec.data[:] = self.W_enc.t().data
+        self.W_dec.data[:] = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
+
+        d = self.cfg["dict_size"]
+        device = cfg["device"]
+        dtype = cfg["dtype"]
+        self.b_gate = nn.Parameter(torch.zeros(d, dtype=dtype, device=device))
+        self.b_mag = nn.Parameter(torch.zeros(d, dtype=dtype, device=device))
+        self.r_mag = nn.Parameter(torch.zeros(d, dtype=dtype, device=device))
+
+        self.num_batches_not_active = torch.zeros((d,), device=device)
+
+        self.to(cfg["dtype"]).to(cfg["device"])
+
+    def preprocess_input(self, x):
+        if self.cfg.get("input_unit_norm", False):
+            x_mean = x.mean(dim=-1, keepdim=True)
+            x = x - x_mean
+            x_std = x.std(dim=-1, keepdim=True)
+            x = x / (x_std + 1e-5)
+            return x, x_mean, x_std
+        return x, None, None
+
+    def postprocess_output(self, x_reconstruct, x_mean, x_std):
+        if self.cfg.get("input_unit_norm", False):
+            x_reconstruct = x_reconstruct * x_std + x_mean
+        return x_reconstruct
+
+    @torch.no_grad()
+    def make_decoder_weights_and_grad_unit_norm(self):
+        W_dec_normed = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
+        W_dec_grad_proj = (self.W_dec.grad * W_dec_normed).sum(
+            -1, keepdim=True
+        ) * W_dec_normed
+        self.W_dec.grad -= W_dec_grad_proj
+        self.W_dec.data = W_dec_normed
+
+    def update_inactive_features(self, acts):
+        self.num_batches_not_active += (acts.sum(0) == 0).float()
+        self.num_batches_not_active[acts.sum(0) > 0] = 0
+
+    def forward(self, x):
+        x, x_mean, x_std = self.preprocess_input(x)
+        x_cent = x - self.b_dec
+
+        gating_pre = x_cent @ self.W_enc + self.b_gate
+        active = (gating_pre > 0).to(x.dtype)
+        mag_pre = x_cent @ (self.W_enc * self.r_mag.exp()) + self.b_mag
+        mags = F.relu(mag_pre)
+        feature_acts = active * mags
+
+        x_reconstruct = feature_acts @ self.W_dec + self.b_dec
+        self.update_inactive_features(feature_acts)
+
+        l2_loss = (x_reconstruct.float() - x.float()).pow(2).mean()
+
+        pi_gate_act = F.relu(gating_pre)
+        w_norm = self.W_dec.norm(dim=-1)
+        l1_loss = self.cfg["l1_coeff"] * (
+            (pi_gate_act * w_norm).sum(dim=-1).mean()
+        )
+
+        via_gate = pi_gate_act @ self.W_dec + self.b_dec
+        aux_recon = (via_gate - x).pow(2).sum(dim=-1).mean()
+        gated_aux = self.cfg.get("gated_aux_coeff", 1.0)
+        aux_loss = gated_aux * aux_recon
+
+        loss = l2_loss + l1_loss + aux_loss
+
+        l0_norm = (feature_acts > 0).float().sum(-1).mean()
+        l1_norm = feature_acts.abs().sum(-1).mean()
+
+        num_dead_features = (
+            self.num_batches_not_active > self.cfg["n_batches_to_dead"]
+        ).sum()
+
+        sae_out = self.postprocess_output(x_reconstruct, x_mean, x_std)
+        return {
+            "sae_out": sae_out,
+            "feature_acts": feature_acts,
+            "num_dead_features": num_dead_features,
+            "loss": loss,
+            "l1_loss": l1_loss,
+            "l2_loss": l2_loss,
+            "l0_norm": l0_norm,
+            "l1_norm": l1_norm,
+            "aux_loss": aux_loss,
+        }
+
+
 class JumpReLUInferenceSAE(torch.nn.Module):
 
     def __init__(self, sae, theta):
@@ -373,4 +486,28 @@ class JumpReLUInferenceSAE(torch.nn.Module):
 
         x_reconstruct = acts @ self.W_dec + self.b_dec
 
+        return x_reconstruct, acts
+
+
+class GatedInferenceSAE(nn.Module):
+    """Inference-only gated SAE: returns (reconstruction, feature_acts) like JumpReLUInferenceSAE."""
+
+    def __init__(self, sae: GatedSAE):
+        super().__init__()
+        self.W_enc = sae.W_enc
+        self.W_dec = sae.W_dec
+        self.b_dec = sae.b_dec
+        self.b_gate = sae.b_gate
+        self.b_mag = sae.b_mag
+        self.r_mag = sae.r_mag
+        self.dict_size = self.W_enc.shape[1]
+
+    def forward(self, x):
+        x_cent = x - self.b_dec
+        gating_pre = x_cent @ self.W_enc + self.b_gate
+        active = (gating_pre > 0).to(x.dtype)
+        mag_pre = x_cent @ (self.W_enc * self.r_mag.exp()) + self.b_mag
+        mags = F.relu(mag_pre)
+        acts = active * mags
+        x_reconstruct = acts @ self.W_dec + self.b_dec
         return x_reconstruct, acts

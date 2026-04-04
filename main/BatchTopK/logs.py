@@ -109,9 +109,9 @@ def save_checkpoint(sae, cfg, theta, step):
 
     # Save model state
     sae_path = os.path.join(save_dir, f"step_{step}.pt")
-    torch.save({
-        "state_dict": sae.state_dict(),
-        "theta": theta
-    }, sae_path)
+    payload = {"state_dict": sae.state_dict()}
+    if theta is not None:
+        payload["theta"] = theta
+    torch.save(payload, sae_path)
 
     print(f"Model saved at {sae_path}")

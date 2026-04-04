@@ -1,9 +1,11 @@
 # import transformer_lens.utils as utils
-import torch 
+import torch
+
 
 def get_default_cfg():
-    default_cfg = {
+    return {
         "seed": 49,
+        "layer": 6,
 
         "batch_size": 512,
         "lr": 3e-4,
@@ -21,7 +23,7 @@ def get_default_cfg():
 
         "device": "cuda:0",
 
-        "act_size": 256,        # HyenaDNA embedding dimension
+        "act_size": 256,  # HyenaDNA embedding dimension
         "dict_size": 8192,
 
         "embedding_glob": "embeddings/*.pt",
@@ -40,15 +42,27 @@ def get_default_cfg():
 
         "top_k": 16,
         "top_k_aux": 64,
-        "aux_penalty": 1/32,
+        "aux_penalty": 1 / 32,
 
         "bandwidth": 0.001,
+
+        # Gated SAE: auxiliary reconstruction loss scale (matches sae_lens default pairing)
+        "gated_aux_coeff": 1.0,
     }
-    default_cfg = post_init_cfg(default_cfg)
-    return default_cfg
+
 
 def post_init_cfg(cfg):
-    cfg['embedding_glob'] = data/embeddings/train/layer_{cfg['layer']}/*.pt
-    cfg["name"] = f"layer{cfg['layer']}_{cfg['dict_size']}_{cfg['sae_type']}_{cfg['top_k']}_{cfg['lr']}"
+    cfg["embedding_glob"] = f"data/embeddings/train/layer_{cfg['layer']}/*.pt"
+    st = cfg.get("sae_type", "batchtopk").lower()
+    if st == "gated":
+        cfg["name"] = (
+            f"layer{cfg['layer']}_{cfg['dict_size']}_{cfg['sae_type']}_"
+            f"l1{cfg['l1_coeff']}_aux{cfg.get('gated_aux_coeff', 1.0)}_{cfg['lr']}"
+        )
+    else:
+        cfg["name"] = (
+            f"layer{cfg['layer']}_{cfg['dict_size']}_{cfg['sae_type']}_"
+            f"{cfg['top_k']}_{cfg['lr']}"
+        )
     cfg["run_dir"] = f"trained_models/{cfg['name']}"
     return cfg

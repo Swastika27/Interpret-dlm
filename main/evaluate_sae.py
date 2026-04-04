@@ -65,7 +65,15 @@ import yaml
 from tqdm import tqdm
 import json
 
-from BatchTopK.sae import BatchTopKSAE, TopKSAE, VanillaSAE, JumpReLUSAE, JumpReLUInferenceSAE
+from BatchTopK.sae import (
+    BatchTopKSAE,
+    TopKSAE,
+    VanillaSAE,
+    JumpReLUSAE,
+    JumpReLUInferenceSAE,
+    GatedSAE,
+    GatedInferenceSAE,
+)
 
 
 
@@ -98,6 +106,7 @@ def load_sae(cfg: dict, checkpoint_path: str, device: str):
         "top_k":       TopKSAE,
         "vanilla":     VanillaSAE,
         "jumprelu":    JumpReLUSAE,
+        "gated":       GatedSAE,
     }
     sae = cls_map[arch](cfg)
     sae.load_state_dict(sae_state, strict=False)
@@ -111,6 +120,9 @@ def load_sae(cfg: dict, checkpoint_path: str, device: str):
             )
         print(f"Wrapping BatchTopKSAE with JumpReLUInferenceSAE (theta={theta:.6f})")
         sae = JumpReLUInferenceSAE(sae, theta=theta)
+    elif arch == "gated":
+        print("Wrapping GatedSAE with GatedInferenceSAE")
+        sae = GatedInferenceSAE(sae)
 
     sae.eval().to(device)
     return sae
