@@ -35,7 +35,19 @@ def parse_args():
     parser.add_argument("--l1_coeff", type=float, default=0.0,
                         help="L1 regularization coefficient (gated: gate-path L1 scale)")
     parser.add_argument("--gated_aux_coeff", type=float, default=1.0,
-                        help="Auxiliary reconstruction loss coefficient (gated SAE only)")
+                        help="Auxiliary reconstruction loss coefficient (gated SAE; paper Eq. 8 uses 1)")
+    parser.add_argument("--gated_resample_steps", type=int, default=25_000,
+                        help="Run dead-feature resampling every N steps (0=off; paper Appendix D)")
+    parser.add_argument("--gated_resample_dead_batches", type=int, default=200,
+                        help="Resample features inactive for this many consecutive batches")
+    parser.add_argument("--gated_resample_warmup_steps", type=int, default=1_000,
+                        help="Cosine LR warm-up steps after resampling (paper: 1000)")
+    parser.add_argument("--gated_resample_enc_norm_frac", type=float, default=0.2,
+                        help="Bricken-style: new encoder column scale = frac * mean alive column L2 norm")
+    parser.add_argument("--gated_resample_uniform", action="store_true",
+                        help="Use uniform random batch indices instead of loss-weighted resampling")
+    parser.add_argument("--no_gated_paper_optimizer", action="store_true",
+                        help="Do not override Adam betas to beta1=0, beta2=0.999 for gated SAE")
     parser.add_argument("--act_size", type=int, default=256,
                         help="Activation size (input dimensionality)")
     parser.add_argument("--device", type=str, default="cuda",
@@ -80,6 +92,12 @@ def main():
     cfg["wandb_project"]   = args.wandb_project
     cfg["l1_coeff"]        = args.l1_coeff
     cfg["gated_aux_coeff"] = args.gated_aux_coeff
+    cfg["gated_resample_steps"] = args.gated_resample_steps
+    cfg["gated_resample_dead_batches"] = args.gated_resample_dead_batches
+    cfg["gated_resample_warmup_steps"] = args.gated_resample_warmup_steps
+    cfg["gated_resample_enc_norm_frac"] = args.gated_resample_enc_norm_frac
+    cfg["gated_resample_loss_weighted"] = not args.gated_resample_uniform
+    cfg["gated_use_paper_optimizer"] = not args.no_gated_paper_optimizer
     cfg["act_size"]        = args.act_size
     cfg["device"]          = args.device
     cfg["bandwidth"]       = args.bandwidth

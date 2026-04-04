@@ -46,14 +46,27 @@ def get_default_cfg():
 
         "bandwidth": 0.001,
 
-        # Gated SAE: auxiliary reconstruction loss scale (matches sae_lens default pairing)
+        # Gated SAE (arXiv:2404.16014 Appendix D / G): aux matches Eq. 8 (coefficient 1).
         "gated_aux_coeff": 1.0,
+        # Paper: Adam beta1=0, beta2=0.999; lr=3e-4 for gated (vs 1e-3 baseline in paper).
+        "gated_use_paper_optimizer": True,
+        # Resampling (Appendix D): Bricken-style; interval not fixed in paper — default 25k steps.
+        "gated_resample_steps": 25_000,
+        "gated_resample_dead_batches": 200,
+        "gated_resample_warmup_steps": 1_000,
+        # Bricken neuron resampling: sample inputs ∝ per-example squared recon error.
+        "gated_resample_loss_weighted": True,
+        # Scale new encoder column to frac * mean(||W_enc[:, alive]||_2); decoder row stays unit.
+        "gated_resample_enc_norm_frac": 0.2,
     }
 
 
 def post_init_cfg(cfg):
     cfg["embedding_glob"] = f"data/embeddings/train/layer_{cfg['layer']}/*.pt"
     st = cfg.get("sae_type", "batchtopk").lower()
+    if st == "gated" and cfg.get("gated_use_paper_optimizer", True):
+        cfg["beta1"] = 0.0
+        cfg["beta2"] = 0.999
     if st == "gated":
         cfg["name"] = (
             f"layer{cfg['layer']}_{cfg['dict_size']}_{cfg['sae_type']}_"

@@ -352,9 +352,28 @@ class JumpReLUSAE(BaseAutoencoder):
 
 class GatedSAE(nn.Module):
     """
-    Gated sparse autoencoder (encoder: hard gate on pre-activation + magnitude path).
-    Matches the loss structure of sae_lens GatedTrainingSAE (main MSE + L1 on relu(pi_gate)
-    weighted by decoder row norms + auxiliary reconstruction from the gating path only).
+    Gated sparse autoencoder (Rajamanoharan et al., arXiv:2404.16014).
+
+    Forward matches Appendix G (Figure 17): gate on pi_gate pre-activation, magnitudes
+    from ReLU(W_mag @ x_cent + b_mag) with tied weights W_mag = W_gate * exp(r_mag).
+
+    Loss matches Equation 8 / Appendix G (Figure 18):
+      - L_recon: MSE on full gated reconstruction (gradients through gate path are blocked
+        by the Heaviside; magnitude path carries gradients).
+      - L_sparsity: lambda * ||ReLU(pi_gate)||_1  (sum over features, mean over batch).
+      - L_aux: MSE(x, ReLU(pi_gate) @ W_dec_frozen + b_dec_frozen) — decoder frozen
+        (stop-gradient) so only gate parameters receive auxiliary signal.
+
+    Training details (Appendix D): Adam beta1=0, beta2=0.999; lr=3e-4 for gated runs;
+    batch size 4096 in paper (override via config); resampling + post-resample LR warm-up
+    are implemented in training.py / gated_resampling.py.
+
+    Inconsistencies vs paper (documented):
+      - Input unit norm: optional via cfg (paper uses raw LM activations).
+      - Resampling interval/dead threshold: not specified numerically in the paper; we use
+        configurable defaults (see gated_resampling.py).
+      - Bricken resampling uses loss-weighted sampling + encoder norm scaling; see cfg keys
+        gated_resample_loss_weighted, gated_resample_enc_norm_frac.
     """
 
     def __init__(self, cfg):
@@ -388,6 +407,10 @@ class GatedSAE(nn.Module):
         self.to(cfg["dtype"]).to(cfg["device"])
 
     def preprocess_input(self, x):
+        """
+        Optional per-token normalization only. Does not subtract b_dec — forward() and
+        gated_resampling assume x_cent = preprocess(x) - b_dec is the only centering.
+        """
         if self.cfg.get("input_unit_norm", False):
             x_mean = x.mean(dim=-1, keepdim=True)
             x = x - x_mean
@@ -429,13 +452,15 @@ class GatedSAE(nn.Module):
 
         l2_loss = (x_reconstruct.float() - x.float()).pow(2).mean()
 
+        # Eq. 8: L1 on ReLU(pi_gate), not decoder-norm-weighted (unlike some sae_lens ports).
         pi_gate_act = F.relu(gating_pre)
-        w_norm = self.W_dec.norm(dim=-1)
-        l1_loss = self.cfg["l1_coeff"] * (
-            (pi_gate_act * w_norm).sum(dim=-1).mean()
-        )
+        l1_per_sample = pi_gate_act.sum(dim=-1)
+        l1_loss = self.cfg["l1_coeff"] * l1_per_sample.mean()
 
-        via_gate = pi_gate_act @ self.W_dec + self.b_dec
+        # Auxiliary path: frozen decoder (paper Fig. 18; ablation Fig. 8 unfreeze hurts).
+        W_dec_f = self.W_dec.detach()
+        b_dec_f = self.b_dec.detach()
+        via_gate = pi_gate_act @ W_dec_f + b_dec_f
         aux_recon = (via_gate - x).pow(2).sum(dim=-1).mean()
         gated_aux = self.cfg.get("gated_aux_coeff", 1.0)
         aux_loss = gated_aux * aux_recon

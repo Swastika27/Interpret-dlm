@@ -3,7 +3,12 @@ import tqdm
 from logs import init_wandb, log_wandb, log_model_performance, save_checkpoint
 import os
 import csv
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
+
+from gated_resampling import (
+    apply_gated_lr,
+    resample_dead_gated_features,
+)
 
 def write_csv_row(path: str, header: List[str], row: Dict[str, float]) -> None:
     exists = os.path.exists(path)
@@ -28,8 +33,15 @@ def _theta_for_checkpoint(sae, cfg) -> Optional[float]:
 
 def train_sae_wo_model(sae, activation_store, cfg):
     num_batches = cfg["num_tokens"] // cfg["batch_size"]
-    optimizer = torch.optim.Adam(sae.parameters(), lr=cfg["lr"], betas=(cfg["beta1"], cfg["beta2"]))
+    base_lr = float(cfg["lr"])
+    cfg["base_lr"] = base_lr
+    optimizer = torch.optim.Adam(
+        sae.parameters(), lr=base_lr, betas=(cfg["beta1"], cfg["beta2"])
+    )
     pbar = tqdm.trange(num_batches)
+
+    gated_state: Dict[str, Any] = {"in_warmup": False, "warmup_step": 0}
+    is_gated = cfg.get("sae_type", "").lower() == "gated"
 
     # wandb_run = init_wandb(cfg)
     os.makedirs(cfg["run_dir"], exist_ok=True)
@@ -48,6 +60,9 @@ def train_sae_wo_model(sae, activation_store, cfg):
     
     for i in pbar:
         batch = activation_store.next_batch()
+        if is_gated:
+            apply_gated_lr(optimizer, cfg, gated_state, base_lr)
+
         sae_output = sae(batch)
         loss = sae_output["loss"]
         # log_wandb(sae_output, i, wandb_run)
@@ -74,6 +89,26 @@ def train_sae_wo_model(sae, activation_store, cfg):
         sae.make_decoder_weights_and_grad_unit_norm()
         optimizer.step()
         optimizer.zero_grad()
+
+        if is_gated:
+            interval = int(cfg.get("gated_resample_steps", 25_000))
+            just_reset_warmup = False
+            if interval > 0 and i > 0 and i % interval == 0:
+                n_res = resample_dead_gated_features(
+                    sae, batch, cfg, gated_state=gated_state
+                )
+                just_reset_warmup = n_res > 0
+                if n_res > 0:
+                    print(
+                        f"  [gated] Resampled {n_res} dead features; LR warm-up "
+                        f"({cfg.get('gated_resample_warmup_steps', 1000)} steps)"
+                    )
+            if gated_state.get("in_warmup", False) and not just_reset_warmup:
+                gated_state["warmup_step"] = int(gated_state.get("warmup_step", 0)) + 1
+                ws_lim = int(cfg.get("gated_resample_warmup_steps", 1000))
+                if gated_state["warmup_step"] >= ws_lim:
+                    gated_state["in_warmup"] = False
+                    gated_state["warmup_step"] = 0
 
     theta = _theta_for_checkpoint(sae, cfg)
     save_checkpoint(sae, cfg, theta, i)
