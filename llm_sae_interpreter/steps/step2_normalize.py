@@ -34,20 +34,34 @@ def normalise_per_feature(df: pd.DataFrame) -> pd.DataFrame:
       1. Clamp activation_value to [0, inf)
       2. Scale so the feature's max activation → 10
       3. Round to nearest integer
-    """
-    def _norm_group(group):
-        vals = group["activation_value"].clip(lower=0.0)
-        max_val = vals.max()
-        if max_val > 0:
-            group = group.copy()
-            group["activation_norm"] = (vals / max_val * 10).round().astype(int)
-        else:
-            group = group.copy()
-            group["activation_norm"] = 0
-        return group
 
-    tqdm.pandas(desc="Normalising")
-    df = df.groupby("feature_idx", group_keys=False).progress_apply(_norm_group)
+    Uses vectorised groupby transform to avoid pandas dropping the groupby
+    key column (a known issue with groupby().apply() in newer pandas versions).
+    """
+    df = df.copy()
+
+    # Clamp negatives to zero
+    clamped = df["activation_value"].clip(lower=0.0)
+
+    # Per-feature maximum (broadcast back to every row via transform)
+    print("  Computing per-feature max activations ...")
+    feature_max = (
+        clamped
+        .groupby(df["feature_idx"])
+        .transform("max")
+    )
+
+    # Scale to 0–10 and round; where max == 0, result stays 0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        scaled = np.where(feature_max > 0, clamped / feature_max * 10, 0.0)
+
+    df["activation_norm"] = np.round(scaled).astype(int)
+
+    # Sanity check: feature_idx column must still be present
+    assert "feature_idx" in df.columns, (
+        "feature_idx column was lost — this should not happen with transform()"
+    )
+
     return df
 
 
@@ -97,11 +111,16 @@ def run() -> pd.DataFrame:
     # ── Load ────────────────────────────────────────────────────────────────
     print(f"\nLoading {SEQUENCES_CSV} ...")
     df = pd.read_csv(SEQUENCES_CSV, dtype={"coord_chrom": str})
+    # Reset index so it is clean 0..N-1 — avoids any residual index-as-column
+    # issues that can arise after groupby operations downstream.
+    df = df.reset_index(drop=True)
     print(f"  {len(df)} rows | {df['feature_idx'].nunique()} features")
+    print(f"  Columns: {list(df.columns)}")
 
     # ── Normalise ───────────────────────────────────────────────────────────
     print("\nNormalising activations (per-feature, 0–10) ...")
     df = normalise_per_feature(df)
+    print(f"  Done. Columns: {list(df.columns)}")
 
     # ── Highlight ───────────────────────────────────────────────────────────
     print("\nAdding highlighted sequences ...")
@@ -112,8 +131,10 @@ def run() -> pd.DataFrame:
     print(f"\nSaved {len(df)} rows → {NORMALIZED_CSV}")
 
     # ── Summary ─────────────────────────────────────────────────────────────
-    print("\nSample normalised activations (feature 0, top 5):")
-    sample = df[df["feature_idx"] == 0].nlargest(5, "activation_norm")[
+    # Use the first feature that actually exists rather than assuming idx 0
+    first_feat = int(df["feature_idx"].iloc[0])
+    print(f"\nSample normalised activations (feature {first_feat}, top 5):")
+    sample = df[df["feature_idx"] == first_feat].nlargest(5, "activation_norm")[
         ["feature_idx", "rank", "activation_value", "activation_norm",
          "coord_chrom", "coord_start", "highlighted_sequence"]
     ]

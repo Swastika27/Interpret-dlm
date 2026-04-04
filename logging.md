@@ -349,3 +349,5 @@ python3 find_tomtom_matches.py \
   --out_dir "../runs/sae/layer8_bt8/tomtom"
 ```
 
+
+ALways check your **saving** and **loading** dicts. THESE TWO **MUST** match.

@@ -128,23 +128,54 @@ def count_pairwise_per_feature(
     all_tokens_bed: pybedtools.BedTool,
     concept_beds: dict[str, pybedtools.BedTool],
     n_features: int,
-) -> dict[tuple, list[int]]:
+) -> dict[tuple, dict[str, list[int]]]:
     """
-    For each pair (A, B): intersect all_tokens with A, then intersect result with B.
-    Returns {(nameA, nameB): [count_per_feature]}.
-    Two BEDTools calls per pair regardless of n_features.
+    For each pair (A, B), compute all four Venn cells independently:
+        in_A_only  : overlaps A, does NOT overlap B   → intersect A, then -v B
+        in_B_only  : overlaps B, does NOT overlap A   → intersect B, then -v A
+        in_both    : overlaps A AND B                 → intersect A, then -u B
+        in_neither : computed separately in count_neither_per_feature
+
+    Returns {(nameA, nameB): {"A_only": [...], "B_only": [...], "both": [...]}}
+    Each list is indexed by feature_idx.
     """
     names  = list(concept_beds)
     result = {}
+
     for a, b in itertools.combinations(names, 2):
-        in_a = all_tokens_bed.intersect(concept_beds[a], u=True)
-        counts = [0] * n_features
+        a_only  = [0] * n_features
+        b_only  = [0] * n_features
+        both    = [0] * n_features
+
+        if len(all_tokens_bed) == 0:
+            result[(a, b)] = {"A_only": a_only, "B_only": b_only, "both": both}
+            continue
+
+        bed_a = concept_beds[a]
+        bed_b = concept_beds[b]
+
+        # Tokens in both A and B
+        in_a      = all_tokens_bed.intersect(bed_a, u=True)
         if len(in_a) > 0:
-            in_ab = in_a.intersect(concept_beds[b], u=True)
+            in_ab = in_a.intersect(bed_b, u=True)
             for interval in in_ab:
-                fi = int(interval.name)
-                counts[fi] += 1
-        result[(a, b)] = counts
+                both[int(interval.name)] += 1
+
+        # Tokens in A but NOT B
+        if len(in_a) > 0:
+            in_a_not_b = in_a.intersect(bed_b, v=True)
+            for interval in in_a_not_b:
+                a_only[int(interval.name)] += 1
+
+        # Tokens in B but NOT A
+        in_b = all_tokens_bed.intersect(bed_b, u=True)
+        if len(in_b) > 0:
+            in_b_not_a = in_b.intersect(bed_a, v=True)
+            for interval in in_b_not_a:
+                b_only[int(interval.name)] += 1
+
+        result[(a, b)] = {"A_only": a_only, "B_only": b_only, "both": both}
+
     return result
 
 
@@ -201,9 +232,10 @@ def write_venn(
         for fi in range(n_features):
             nt = n_totals[fi]
             for a, b in pairs:
-                n_both   = pairwise_hits[(a, b)][fi]
-                n_a_only = per_concept_hits[a][fi] - n_both
-                n_b_only = per_concept_hits[b][fi] - n_both
+                pw       = pairwise_hits[(a, b)]
+                n_both   = pw["both"][fi]
+                n_a_only = pw["A_only"][fi]
+                n_b_only = pw["B_only"][fi]
                 writer.writerow({
                     "feature_idx": fi, "concept_A": a, "concept_B": b,
                     "n_total":   nt,

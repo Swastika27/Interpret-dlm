@@ -2,7 +2,7 @@
 find_top_activations.py  (optimized)
 
 For each SAE feature, find the top-N tokens (by activation value) across
-train / val / test shards, and save them with l-token genomic context windows.
+train / val / test shards, and save them.
 
 Key optimizations over the original:
   1. Vectorized per-chunk topk — eliminates the O(chunk * n_features) Python loop.
@@ -20,7 +20,6 @@ Usage:
         --layer           2 \
         --splits          train val test \
         --top_n           10 \
-        --context_len     5 \
         --out_dir         results/top_activations \
         --device          cuda \
         --batch_size      4096 \
@@ -33,12 +32,15 @@ Output layout:
 
 top_activations.pt keys:
     act_values   FloatTensor [n_features, top_n]
-    token_pos    LongTensor  [n_features, top_n]   position within sequence
-    coords       list[list[tuple]]                 [n_features][top_n] → (chrom,start,end)
-    context_seqs list[list[list]]                  [n_features][top_n] → context coord window
+    token_pos    LongTensor  [n_features, top_n]   position within the model window (0..L-1)
+    coords       list[list[tuple]]                 [n_features][top_n] → (chrom,start,end) full window BED
+    context_seqs list[list[str]]                   [n_features][top_n] → same window as "chrom:start-end" (llm_sae_interpreter CSV column)
     split        list[list[str]]                   [n_features][top_n] → "train"/"val"/"test"
     shard_path   list[list[str]]                   [n_features][top_n] → source shard file
     cfg          dict
+
+Coordinates match the embedding BED window (e.g. 512 bp); tok_pos indexes the activating base within
+that window — compatible with llm_sae_interpreter/steps/step1_fetch_sequences.py and step2_normalize.py.
 """
 
 import argparse
@@ -111,21 +113,40 @@ def get_activations(sae, x: torch.Tensor) -> torch.Tensor:
     raise NotImplementedError("Add activation extraction for your SAE type here.")
 
 
-# ---------------------------------------------------------------------------
-# Context window helper
-# ---------------------------------------------------------------------------
+def _window_bed_from_seq_coord(seq_coord, L: int) -> Optional[tuple]:
+    """
+    Return the full genomic window (chrom, start, end) for one sequence row.
 
-def build_context_window(
-    per_tok_coords: list,
-    token_pos: int,
-    context_len: int,
-) -> list:
-    n = len(per_tok_coords)
-    return [
-        per_tok_coords[token_pos + offset]
-        if 0 <= token_pos + offset < n else None
-        for offset in range(-context_len, context_len + 1)
-    ]
+    Embeddings store one (chrom, start, end) triple per sequence (standard case).
+    Rare legacy format: list of L per-token triples — span as chrom, first start, last end.
+    """
+    if seq_coord is None:
+        return None
+    if isinstance(seq_coord, (list, tuple)) and len(seq_coord) == 3:
+        chrom, start, end = seq_coord
+        if chrom == "" or start is None or end is None:
+            return None
+        return (chrom, int(start), int(end))
+    if (
+        isinstance(seq_coord, (list, tuple))
+        and len(seq_coord) == L
+        and L > 0
+        and isinstance(seq_coord[0], (list, tuple))
+        and len(seq_coord[0]) == 3
+    ):
+        first, last = seq_coord[0], seq_coord[-1]
+        chrom = first[0]
+        if chrom == "":
+            return None
+        return (chrom, int(first[1]), int(last[2]))
+    return None
+
+
+def _window_context_str(window: Optional[tuple]) -> str:
+    if window is None or len(window) != 3:
+        return ""
+    chrom, start, end = window
+    return f"{chrom}:{int(start)}-{int(end)}"
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +228,6 @@ def process_shards(
     sae,
     shard_paths: List[str],
     split_name: str,
-    context_len: int,
     accumulator: TensorTopN,
     batch_size: int,
     act_size: int,
@@ -274,7 +294,6 @@ def save_results(
     accumulator: TensorTopN,
     shard_registry: List[dict],
     top_n: int,
-    context_len: int,
     layer: int,
     out_dir: str,
 ):
@@ -307,7 +326,7 @@ def save_results(
             if val == -float("inf") or sh_id >= len(shard_registry):
                 # Unfilled slot
                 coords_row.append(None)
-                context_row.append([None] * (2 * context_len + 1))
+                context_row.append("")
                 split_row.append("")
                 shard_row.append("")
                 continue
@@ -323,14 +342,10 @@ def save_results(
             coords_list = reg["coords_list"]
             seq_coord   = coords_list[seq_idx]
 
-            # Resolve per-token vs per-sequence coords
-            if isinstance(seq_coord[0], (list, tuple)) and len(seq_coord) == L:
-                per_tok_coords = seq_coord
-            else:
-                per_tok_coords = [seq_coord] * L
-
-            coord   = per_tok_coords[tok_pos]
-            context = build_context_window(per_tok_coords, tok_pos, context_len)
+            # Full-window BED only (same as embedding shard); tok_pos is index within window.
+            window_bed = _window_bed_from_seq_coord(seq_coord, L)
+            coord = window_bed
+            context = _window_context_str(window_bed)
 
             coords_row.append(coord)
             context_row.append(context)
@@ -351,7 +366,6 @@ def save_results(
         "shard_path":   shard_out,
         "cfg": {
             "top_n":       top_n,
-            "context_len": context_len,
             "layer":       layer,
             "n_features":  n_features,
         },
@@ -378,10 +392,7 @@ def save_results(
             tp    = token_pos_t[fi, rank].item()
             coord = coords_out[fi][rank]
             chrom, cs, ce = (coord if coord and len(coord) == 3 else ("", "", ""))
-            ctx_str = ";".join(
-                f"{c[0]}:{c[1]}-{c[2]}" if (c and len(c) == 3) else "None"
-                for c in context_out[fi][rank]
-            )
+            ctx_str = context_out[fi][rank] if isinstance(context_out[fi][rank], str) else ""
             sh_id   = shard_np[fi, rank].item()
             reg     = shard_registry[sh_id] if sh_id < len(shard_registry) else {}
             flat_idx = tok_np[fi, rank].item()
@@ -410,7 +421,6 @@ def parse_args():
     p.add_argument("--layer",          type=int, required=True, help="Which layer's embeddings to use")
     p.add_argument("--splits",         nargs="+", default=["train", "val", "test"])
     p.add_argument("--top_n",          type=int, default=10,   help="Top-N tokens per feature")
-    p.add_argument("--context_len",    type=int, default=5,    help="Tokens of context on each side")
     p.add_argument("--out_dir",        required=True,          help="Where to write results")
     p.add_argument("--device",         default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--batch_size",     type=int, default=4096, help="Sub-batch size for SAE forward pass")
@@ -431,7 +441,7 @@ def main():
     n_features = cfg["dict_size"]
     act_size   = cfg["act_size"]
     print(f"SAE: dict_size={n_features}, act_size={act_size}")
-    print(f"Scanning splits: {args.splits}  |  top_n={args.top_n}  |  context_len={args.context_len}")
+    print(f"Scanning splits: {args.splits}  |  top_n={args.top_n}")
 
     # Single accumulator across all splits  (optimization #2)
     accumulator    = TensorTopN(n_features, args.top_n, device=args.device)
@@ -448,7 +458,6 @@ def main():
             sae=sae,
             shard_paths=shard_paths,
             split_name=split,
-            context_len=args.context_len,
             accumulator=accumulator,
             batch_size=args.batch_size,
             act_size=act_size,
@@ -462,7 +471,6 @@ def main():
         accumulator    = accumulator,
         shard_registry = shard_registry,
         top_n          = args.top_n,
-        context_len    = args.context_len,
         layer          = args.layer,
         out_dir        = args.out_dir,
     )
