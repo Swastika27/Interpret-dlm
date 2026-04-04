@@ -44,6 +44,8 @@ This version streams shards one at a time:
 Peak RAM is now O(n_concepts × dict_size) ≈ a few MB, independent of dataset
 size, instead of O(N_tokens × dict_size).
 
+Gated SAE: set "sae_type": "gated" in the SAE config JSON from training.
+
 Because we never materialise all negatives simultaneously we correct for the
 positive/negative class imbalance analytically in compute_metrics_from_counts()
 by scaling the accumulated negative counts down to match n_pos.
@@ -66,7 +68,13 @@ from tqdm import tqdm
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from BatchTopK.sae import (
-    BatchTopKSAE, TopKSAE, VanillaSAE, JumpReLUSAE, JumpReLUInferenceSAE,
+    BatchTopKSAE,
+    TopKSAE,
+    VanillaSAE,
+    JumpReLUSAE,
+    JumpReLUInferenceSAE,
+    GatedSAE,
+    GatedInferenceSAE,
 )
 
 
@@ -193,6 +201,7 @@ def load_sae(cfg: dict, checkpoint_path: str, device: str):
         "top_k":     TopKSAE,
         "vanilla":   VanillaSAE,
         "jumprelu":  JumpReLUSAE,
+        "gated":     GatedSAE,
     }
     sae = cls_map[arch](cfg)
     sae.load_state_dict(sae_state, strict=False)
@@ -202,6 +211,9 @@ def load_sae(cfg: dict, checkpoint_path: str, device: str):
             raise ValueError("BatchTopKSAE checkpoint has no 'theta'.")
         print(f"Wrapping BatchTopKSAE with JumpReLUInferenceSAE (theta={theta:.6f})")
         sae = JumpReLUInferenceSAE(sae, theta=theta)
+    elif arch == "gated":
+        print("Wrapping GatedSAE with GatedInferenceSAE")
+        sae = GatedInferenceSAE(sae)
 
     sae.eval().to(device)
     return sae
@@ -214,7 +226,7 @@ def get_activations(sae, x: torch.Tensor) -> torch.Tensor:
     device = next(sae.parameters()).device
     x = x.to(device=device, dtype=dtype)
 
-    if isinstance(sae, JumpReLUInferenceSAE):
+    if isinstance(sae, (JumpReLUInferenceSAE, GatedInferenceSAE)):
         _, acts = sae(x)
         return acts.float().cpu()
 

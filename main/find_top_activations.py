@@ -41,6 +41,9 @@ top_activations.pt keys:
 
 Coordinates match the embedding BED window (e.g. 512 bp); tok_pos indexes the activating base within
 that window — compatible with llm_sae_interpreter/steps/step1_fetch_sequences.py and step2_normalize.py.
+
+Gated SAE: use the same checkpoint and config.json from training with "sae_type": "gated"
+(BatchTopK/main.py saves config next to checkpoints).
 """
 
 import argparse
@@ -58,7 +61,15 @@ from tqdm import tqdm
 
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
-from BatchTopK.sae import BatchTopKSAE, TopKSAE, VanillaSAE, JumpReLUSAE, JumpReLUInferenceSAE
+from BatchTopK.sae import (
+    BatchTopKSAE,
+    TopKSAE,
+    VanillaSAE,
+    JumpReLUSAE,
+    JumpReLUInferenceSAE,
+    GatedSAE,
+    GatedInferenceSAE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +97,7 @@ def load_sae(cfg: dict, checkpoint_path: str, device: str):
         "top_k":     TopKSAE,
         "vanilla":   VanillaSAE,
         "jumprelu":  JumpReLUSAE,
+        "gated":     GatedSAE,
     }
     sae = cls_map[arch](cfg)
     sae.load_state_dict(sae_state, strict=False)
@@ -98,6 +110,9 @@ def load_sae(cfg: dict, checkpoint_path: str, device: str):
             )
         print(f"Wrapping BatchTopKSAE with JumpReLUInferenceSAE (theta={theta:.6f})")
         sae = JumpReLUInferenceSAE(sae, theta=theta)
+    elif arch == "gated":
+        print("Wrapping GatedSAE with GatedInferenceSAE")
+        sae = GatedInferenceSAE(sae)
 
     sae.eval().to(device)
     return sae
@@ -107,7 +122,7 @@ def load_sae(cfg: dict, checkpoint_path: str, device: str):
 def get_activations(sae, x: torch.Tensor) -> torch.Tensor:
     """Returns (N, n_features) float32 CPU tensor."""
     x = x.to(next(sae.parameters()).device).to(next(sae.parameters()).dtype)
-    if isinstance(sae, JumpReLUInferenceSAE):
+    if isinstance(sae, (JumpReLUInferenceSAE, GatedInferenceSAE)):
         _, acts = sae(x)
         return acts.float().cpu()
     raise NotImplementedError("Add activation extraction for your SAE type here.")
