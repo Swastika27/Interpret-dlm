@@ -3,6 +3,7 @@ import torch
 from functools import partial
 import os
 import json
+from pathlib import Path
 
 def init_wandb(cfg):
     return wandb.init(project=cfg["wandb_project"], name=cfg["name"], config=cfg, reinit=True)
@@ -114,4 +115,10 @@ def save_checkpoint(sae, cfg, theta, step):
         payload["theta"] = theta
     torch.save(payload, sae_path)
 
-    print(f"Model saved at {sae_path}")
+    latest_path = os.path.join(save_dir, "latest.pt")
+    target_path = os.path.relpath(sae_path, start=save_dir)
+
+    if os.path.lexists(latest_path):
+        os.unlink(latest_path)
+
+    os.symlink(target_path, latest_path)
