@@ -122,8 +122,8 @@ for ckpt_step in "${EPOCH_CKPTS[@]}"; do
     python main/evaluate_sae.py \
       --sae_path trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt \
       --cfg_path trained_models/$model_basename/config.json \
-      --val_embeddings_path $docker_base/test_shards/test/layer_${layer} \
-      --test_embeddings_path $docker_base/test_shards/test/layer_${layer} \
+      --val_embeddings_path $docker_base/$disk2_embed_dir/val/layer_${layer} \
+      --test_embeddings_path $docker_base/$disk2_embed_dir/test/layer_${layer} \
       --output_file results/$result_tag/eval_metrics.yaml \
       --device cuda \
       --resume \
@@ -138,9 +138,9 @@ for ckpt_step in "${EPOCH_CKPTS[@]}"; do
   python main/find_top_activations.py \
     --sae_checkpoint  trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt \
     --sae_cfg         trained_models/$model_basename/config.json \
-    --embed_dir       test_shards \
+    --embed_dir       $disk2_embed_dir \
     --layer           $layer \
-    --splits          test \
+    --splits          val test \
     --top_n           200 \
     --out_dir         results/$result_tag/top_activations \
     --device          cuda \
@@ -150,7 +150,7 @@ for ckpt_step in "${EPOCH_CKPTS[@]}"; do
 
   python main/annotate_top_activations.py \
     --top_activations  results/$result_tag/top_activations/top_activations.pt \
-    --bed_dir          test_annotations \
+    --bed_dir          all_annotations \
     --out_dir          results/$result_tag/feature_annotation_assoc \
     --resume
 
@@ -158,10 +158,10 @@ for ckpt_step in "${EPOCH_CKPTS[@]}"; do
   python main/concept_feature_analysis.py \
     --sae_checkpoint  trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt \
     --sae_cfg         trained_models/$model_basename/config.json \
-    --save_dir        test_shards \
+    --save_dir        $disk2_embed_dir \
     --layer           $layer \
-    --splits          test \
-    --bed_dir         test_annotations/ \
+    --splits          val test \
+    --bed_dir         all_annotations/ \
     --out_dir         results/$result_tag/concept_analysis \
     --device          cuda \
     --batch_size      1024 \
