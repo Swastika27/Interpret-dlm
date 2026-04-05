@@ -65,7 +65,7 @@ import yaml
 from tqdm import tqdm
 import json
 
-from BatchTopK.sae import (
+from SAE_training.sae import (
     BatchTopKSAE,
     TopKSAE,
     VanillaSAE,

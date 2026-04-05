@@ -351,3 +351,7 @@ python3 find_tomtom_matches.py \
 
 
 ALways check your **saving** and **loading** dicts. THESE TWO **MUST** match.
+
+Always avoid vanilla python loops ffffffffffffffffor speeeeedup
+
+While creating symlink, use the lowest relative path. that way it stays usable                even in    docker containers. and avvvvvvvvvvvvvvvvoids double prefix.

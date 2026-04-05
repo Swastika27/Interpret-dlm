@@ -61,7 +61,7 @@ from tqdm import tqdm
 
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
-from BatchTopK.sae import (
+from SAE_training.sae import (
     BatchTopKSAE,
     TopKSAE,
     VanillaSAE,

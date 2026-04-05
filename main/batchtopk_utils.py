@@ -1,7 +1,7 @@
 import torch
 import json
 
-from BatchTopK.sae import BatchTopKSAE, TopKSAE, VanillaSAE, JumpReLUSAE, JumpReLUInferenceSAE
+from SAE_training.sae import BatchTopKSAE, TopKSAE, VanillaSAE, JumpReLUSAE, JumpReLUInferenceSAE
 
 
 def restore_cfg_types(cfg):

@@ -67,7 +67,7 @@ from tqdm import tqdm
 
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
-from BatchTopK.sae import (
+from SAE_training.sae import (
     BatchTopKSAE,
     TopKSAE,
     VanillaSAE,
@@ -319,13 +319,13 @@ def accumulate_shard(
     chroms, positions = _build_token_positions(coords_raw, L)
 
     token_labels = np.zeros((B * L, n_concepts), dtype=bool)
-    chrom_to_indices: Dict[str, List[int]] = defaultdict(list)
-    for flat_i, ch in enumerate(chroms):
-        print(f"        Mapping token {flat_i} to chrom '{ch}' ...")
-        chrom_to_indices[ch].append(flat_i)
+    chroms_arr = np.array(chroms)
+    chrom_to_indices: Dict[str, np.ndarray] = {}
+    for ch in np.unique(chroms_arr):
+        chrom_to_indices[ch] = np.where(chroms_arr == ch)[0]
 
     for ch, flat_indices in chrom_to_indices.items():
-        print(f"      Processing chrom '{ch}' with {len(flat_indices)} tokens ...")
+        # print(f"      Processing chrom '{ch}' with {len(flat_indices)} tokens ...")
         flat_arr = np.array(flat_indices, dtype=np.int64)
         pos_arr  = positions[flat_arr]
         for ci, bed in enumerate(bed_indices):
@@ -336,7 +336,7 @@ def accumulate_shard(
     emb_flat     = emb.reshape(B * L, D)
     active_parts = []
     for start in range(0, B * L, batch_size):
-        print(f"      Running SAE on tokens {start} to {min(start + batch_size, B * L)} ...")
+        # print(f"      Running SAE on tokens {start} to {min(start + batch_size, B * L)} ...")
         end   = min(start + batch_size, B * L)
         chunk = get_activations(sae, emb_flat[start:end]).numpy()
         active_parts.append(chunk > 0)          # bool, 4x smaller than float32
@@ -344,7 +344,7 @@ def accumulate_shard(
 
     # ---- 3. Accumulate counts per concept -----------------------------
     for ci in range(n_concepts):
-        print(f"      Accumulating counts for concept {ci} ('{bed_indices[ci].name}') ...")
+        # print(f"      Accumulating counts for concept {ci} ('{bed_indices[ci].name}') ...")
         pos_mask = token_labels[:, ci]
         neg_mask = ~pos_mask
 
@@ -407,15 +407,15 @@ def compute_metrics_from_counts(
         FP = neg_acts_scaled
         TN = n_neg_eff  - neg_acts_scaled
 
-        precision = np.where(TP + FP > 0, TP / (TP + FP), 0.0)
-        recall    = np.where(TP + FN > 0, TP / (TP + FN), 0.0)
-        f1        = np.where(precision + recall > 0,
-                             2 * precision * recall / (precision + recall), 0.0)
+        precision = np.divide(TP, TP + FP, out=np.zeros_like(TP), where=(TP + FP) > 0)
+        recall    = np.divide(TP, TP + FN, out=np.zeros_like(TP), where=(TP + FN) > 0)
+        f1        = np.divide(2 * precision * recall, precision + recall,
+                            out=np.zeros_like(precision), where=(precision + recall) > 0)
 
         tpr = recall
-        tnr = np.where(TN + FP > 0, TN / (TN + FP), 0.0)
-        fpr = np.where(FP + TN > 0, FP / (FP + TN), 0.0)
-        fnr = np.where(FN + TP > 0, FN / (FN + TP), 0.0)
+        tnr = np.divide(TN, TN + FP, out=np.zeros_like(TN), where=(TN + FP) > 0)
+        fpr = np.divide(FP, FP + TN, out=np.zeros_like(FP), where=(FP + TN) > 0)
+        fnr = np.divide(FN, FN + TP, out=np.zeros_like(FN), where=(FN + TP) > 0)
 
         # Fraction of positive tokens on which each feature fires
         baseline_prevalence = pos_acts / n_pos

@@ -7,4 +7,5 @@ results*/*
 all_annotations/*
 test_annotations/*
 .env
+test_shards/*
 
