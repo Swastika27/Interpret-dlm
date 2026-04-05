@@ -66,12 +66,12 @@ model_basename=$model_basename_gated
 #     # --embedding_glob test_shards/*.pt
 
 
-# if [ -n "$(docker ps -f "name=^/${CONTAINER_NAME}$" -f "status=running" -q)" ]; then
-#     echo "The container $CONTAINER_NAME is running."
-# else
-#     echo "The container $CONTAINER_NAME is not running."
-#     docker start $CONTAINER_NAME
-# fi
+if [ -n "$(docker ps -f "name=^/${CONTAINER_NAME}$" -f "status=running" -q)" ]; then
+    echo "The container $CONTAINER_NAME is running."
+else
+    echo "The container $CONTAINER_NAME is not running."
+    docker start $CONTAINER_NAME
+fi
 
 # for split in "val" "test"; do
 #     if [ ! -d "$disk2_embed_dir/$split/layer_${layer}" ]; then
@@ -97,7 +97,7 @@ model_basename=$model_basename_gated
 # Checkpoints to analyse: one marker per training epoch (largest saved step <= epoch end) plus final step
 CK_STEPS=()
 for ep in $(seq 1 "$epoch"); do
-  nominal=$(( ep * batches_per_epoch - 1 ))
+  nominal=$(( ep * batches_per_epoch  ))
   if [ "$nominal" -ge "$num_batches_total" ]; then nominal=$(( num_batches_total - 1 )); fi
   ck=$(( (nominal / checkpoint_freq) * checkpoint_freq ))
   CK_STEPS+=("$ck")
@@ -122,13 +122,13 @@ for ckpt_step in "${EPOCH_CKPTS[@]}"; do
     python main/evaluate_sae.py \
       --sae_path trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt \
       --cfg_path trained_models/$model_basename/config.json \
-      --val_embeddings_path $docker_base/test_shards/test/layer_${layer} \
-      --test_embeddings_path $docker_base/test_shards/test/layer_${layer} \
+      --val_embeddings_path $docker_wdr/test_shards/test/layer_${layer} \
+      --test_embeddings_path $docker_wdr/test_shards/test/layer_${layer} \
       --output_file results/$result_tag/eval_metrics.yaml \
       --device cuda \
       --resume \
-      --val_bed_path data/preprocessed/val.sub.bed \
-      --test_bed_path data/preprocessed/test.sub.bed \
+      --val_bed_path data/preprocessed/val.test.bed \
+      --test_bed_path data/preprocessed/test.test.bed \
       --genome_path data/raw/GRCh38.primary_assembly.genome.fa \
       --hyenadna_checkpoint_path LongSafari/hyenadna-large-1m-seqlen-hf \
       --fidelity_max_seq_len $seq_len \

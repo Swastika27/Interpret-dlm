@@ -144,7 +144,7 @@ python data_utils/extract_clinvar_labels.py \
   -v /:/workspace     \
     hyenadna/hyena-dna     /bin/bash
 ```
-
+**MOUNT /mnt,      not /**
 embedding extraction works on cpu, the gpt script, not on gpu. GPT says it will need   pytorch, cuda rebuild to fix
 
 python - <<EOF

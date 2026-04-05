@@ -615,6 +615,7 @@ def _cofa_load_counts_npz(path: str, n_concepts: int, dict_size: int) -> Optiona
 
 def _cofa_save_resume(out_dir: str, meta: dict, counts: dict) -> None:
     os.makedirs(out_dir, exist_ok=True)
+    os.chmod(out_dir,0o777)
     json_path = os.path.join(out_dir, COFA_RESUME_JSON)
     npz_path  = os.path.join(out_dir, COFA_COUNTS_NPZ)
     tmp_json  = json_path + ".tmp"

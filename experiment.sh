@@ -122,8 +122,8 @@ for ckpt_step in "${EPOCH_CKPTS[@]}"; do
     python main/evaluate_sae.py \
       --sae_path trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt \
       --cfg_path trained_models/$model_basename/config.json \
-      --val_embeddings_path $docker_base/$disk2_embed_dir/val/layer_${layer} \
-      --test_embeddings_path $docker_base/$disk2_embed_dir/test/layer_${layer} \
+      --val_embeddings_path $docker_wdr/$disk2_embed_dir/val/layer_${layer} \
+      --test_embeddings_path $docker_wdr/$disk2_embed_dir/test/layer_${layer} \
       --output_file results/$result_tag/eval_metrics.yaml \
       --device cuda \
       --resume \

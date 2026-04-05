@@ -514,6 +514,7 @@ def _ft_collect_plan(embed_dir: str, splits: List[str], layer: int) -> List[Tupl
 
 def _ft_save_resume(out_dir: str, payload: dict) -> None:
     os.makedirs(out_dir, exist_ok=True)
+    os.chmod(out_dir,        0o777)
     path = os.path.join(out_dir, FIND_TOP_RESUME)
     tmp = path + ".tmp"
     torch.save(payload, tmp)
