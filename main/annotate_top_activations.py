@@ -263,7 +263,9 @@ def parse_args():
 def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
+    os.chmod(args.out_dir, 0o777)
     os.makedirs(args.tmp_dir, exist_ok=True)
+    os.chmod(args.tmp_dir, 0o777)
     pybedtools.set_tempdir(args.tmp_dir)
 
     print(f"Loading {args.top_activations} ...")

@@ -45,6 +45,7 @@ def train_sae_wo_model(sae, activation_store, cfg):
 
     # wandb_run = init_wandb(cfg)
     os.makedirs(cfg["run_dir"], exist_ok=True)
+    os.chmod(cfg["run_dir"], 0o777)
     log_path = os.path.join(cfg["run_dir"], cfg["log_path"])
     print(f"Logging to {log_path}")
     header = [

@@ -559,6 +559,7 @@ def main():
 
     # ---- Write results -----------------------------------------------
     os.makedirs(args.out_dir, exist_ok=True)
+    os.chmod(args.out_dir, 0o777)
     summary_rows = []
 
     for ci, bed in enumerate(bed_indices):
@@ -584,6 +585,7 @@ def main():
 
         concept_dir = os.path.join(args.out_dir, bed.name)
         os.makedirs(concept_dir, exist_ok=True)
+        os.chmod(concept_dir, 0o777)
         write_feature_csv(os.path.join(concept_dir, "all_features.csv"), rows)
         write_feature_csv(os.path.join(concept_dir, "top_features.csv"), top_rows)
 

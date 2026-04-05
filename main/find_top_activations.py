@@ -313,6 +313,7 @@ def save_results(
     out_dir: str,
 ):
     os.makedirs(out_dir, exist_ok=True)
+    os.chmod(out_dir, 0o777)
     n_features = accumulator.n_features
 
     # Move tensors to CPU for indexing
