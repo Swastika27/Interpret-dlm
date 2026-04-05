@@ -23,6 +23,8 @@ SEED=42
 act_size=256
 dict_size=$(($act_size * $expansion_factor))
 num_train_tokens=$(($N_TRAIN * $epoch * $seq_len))
+num_batches_total=$(( num_train_tokens / batch_size ))
+batches_per_epoch=$(( num_batches_total / epoch ))
 
 disk2_embed_dir=/mnt/disk2/2005027/data/embeddings
 docker_base="/workspace"
@@ -92,58 +94,80 @@ model_basename=$model_basename_gated
 #     fi
 # done
 
-# # Evaluate on val and test split
-# # need to run inside docker container since we need to patch hyena model
-# echo "Evaluating on val and test splits..."
-# docker exec $CONTAINER_NAME bash -c "
-#     cd $docker_wdr &&
-#     python main/evaluate_sae.py \
-#       --sae_path "trained_models/$model_basename/checkpoints/latest.pt" \
-#       --cfg_path "trained_models/$model_basename/config.json" \
-#       --val_embeddings_path $docker_base/$disk2_embed_dir/val/layer_${layer} \
-#       --test_embeddings_path $docker_base/$disk2_embed_dir/test/layer_${layer} \
-#       --output_file "results/$model_basename/eval_metrics.yaml" \
-#       --device cuda \
-#       --val_bed_path data/preprocessed/val.sub.bed \
-#       --test_bed_path data/preprocessed/test.sub.bed \
-#       --genome_path data/raw/GRCh38.primary_assembly.genome.fa \
-#       --hyenadna_checkpoint_path LongSafari/hyenadna-large-1m-seqlen-hf \
-#       --fidelity_max_seq_len $seq_len \
-#       --layer_idx $(($layer - 1)) 
-#       "
+# Checkpoints to analyse: one marker per training epoch (largest saved step <= epoch end) plus final step
+CK_STEPS=()
+for ep in $(seq 1 "$epoch"); do
+  nominal=$(( ep * batches_per_epoch - 1 ))
+  if [ "$nominal" -ge "$num_batches_total" ]; then nominal=$(( num_batches_total - 1 )); fi
+  ck=$(( (nominal / checkpoint_freq) * checkpoint_freq ))
+  CK_STEPS+=("$ck")
+done
+last_step=$(( num_batches_total - 1 ))
+CK_STEPS+=("$last_step")
+readarray -t EPOCH_CKPTS < <(printf '%s\n' "${CK_STEPS[@]}" | sort -nu)
 
+for ckpt_step in "${EPOCH_CKPTS[@]}"; do
+  sae_ckpt="trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt"
+  if [ ! -f "$sae_ckpt" ]; then
+    echo "Skipping step ${ckpt_step}: checkpoint not found at $sae_ckpt"
+    continue
+  fi
+  result_tag="${model_basename}_step${ckpt_step}"
+  echo "========== Pipeline for checkpoint step ${ckpt_step} ($result_tag) =========="
 
-# # find top firing tokens per feature
-# python main/find_top_activations.py \
-#         --sae_checkpoint  trained_models/$model_basename/checkpoints/latest.pt \
-#         --sae_cfg         trained_models/$model_basename/config.json \
-#         --embed_dir       $disk2_embed_dir \
-#         --layer           $layer \
-#         --splits          val test \
-#         --top_n           200 \
-#         --out_dir         results/$model_basename/top_activations \
-#         --device          cuda \
-#         --batch_size      2048 \
-#         --num_workers     4
+  # Evaluate on val and test split (HyenaDNA fidelity — run inside docker)
+  echo "Evaluating on val and test splits..."
+  docker exec $CONTAINER_NAME bash -c "
+    cd $docker_wdr &&
+    python main/evaluate_sae.py \
+      --sae_path trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt \
+      --cfg_path trained_models/$model_basename/config.json \
+      --val_embeddings_path $docker_base/$disk2_embed_dir/val/layer_${layer} \
+      --test_embeddings_path $docker_base/$disk2_embed_dir/test/layer_${layer} \
+      --output_file results/$result_tag/eval_metrics.yaml \
+      --device cuda \
+      --resume \
+      --val_bed_path data/preprocessed/val.sub.bed \
+      --test_bed_path data/preprocessed/test.sub.bed \
+      --genome_path data/raw/GRCh38.primary_assembly.genome.fa \
+      --hyenadna_checkpoint_path LongSafari/hyenadna-large-1m-seqlen-hf \
+      --fidelity_max_seq_len $seq_len \
+      --layer_idx $(($layer - 1))
+    "
 
+  python main/find_top_activations.py \
+    --sae_checkpoint  trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt \
+    --sae_cfg         trained_models/$model_basename/config.json \
+    --embed_dir       $disk2_embed_dir \
+    --layer           $layer \
+    --splits          val test \
+    --top_n           200 \
+    --out_dir         results/$result_tag/top_activations \
+    --device          cuda \
+    --batch_size      2048 \
+    --num_workers     4 \
+    --resume
 
-# # find feature to concept association
-# python main/annotate_top_activations.py \
-#         --top_activations  results/$model_basename/top_activations/top_activations.pt \
-#         --bed_dir          all_annotations \
-#         --out_dir          results/$model_basename/feature_annotation_assoc
+  python main/annotate_top_activations.py \
+    --top_activations  results/$result_tag/top_activations/top_activations.pt \
+    --bed_dir          all_annotations \
+    --out_dir          results/$result_tag/feature_annotation_assoc \
+    --resume
 
-echo "running concept -> feature analysis for $model_basename"
-python main/concept_feature_analysis.py \
-        --sae_checkpoint  trained_models/$model_basename/checkpoints/latest.pt \
-        --sae_cfg         trained_models/$model_basename/config.json \
-        --save_dir        $disk2_embed_dir \
-        --layer           $layer \
-        --splits          val test \
-        --bed_dir         all_annotations/ \
-        --out_dir         results/$model_basename/concept_analysis \
-        --device          cuda \
-        --batch_size      1024 \
-        --top_k_features  10 \
-        --seed            $SEED
+  echo "running concept -> feature analysis for $result_tag"
+  python main/concept_feature_analysis.py \
+    --sae_checkpoint  trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt \
+    --sae_cfg         trained_models/$model_basename/config.json \
+    --save_dir        $disk2_embed_dir \
+    --layer           $layer \
+    --splits          val test \
+    --bed_dir         all_annotations/ \
+    --out_dir         results/$result_tag/concept_analysis \
+    --device          cuda \
+    --batch_size      1024 \
+    --top_k_features  10 \
+    --seed            $SEED \
+    --resume
+
+done
 

@@ -49,10 +49,11 @@ Gated SAE: use the same checkpoint and config.json from training with "sae_type"
 import argparse
 import csv
 import glob
+import hashlib
 import json
 import os
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import Callable, List, Set, Tuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -249,6 +250,7 @@ def process_shards(
     device: str,
     num_workers: int,
     shard_registry: List[dict],   # appended in place; index = shard_id
+    after_shard: Optional[Callable[[str], None]] = None,
 ):
     """
     Stream through all shards for one split, updating `accumulator` in place.
@@ -299,6 +301,9 @@ def process_shards(
             topk_vals     = topk_vals.to(accumulator.device)
             topk_flat_idx = topk_flat_idx.to(accumulator.device)
             accumulator.update(topk_vals, topk_flat_idx, shard_id)
+
+        if after_shard is not None:
+            after_shard(shard_path)
 
 
 # ---------------------------------------------------------------------------
@@ -441,7 +446,84 @@ def parse_args():
     p.add_argument("--device",         default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--batch_size",     type=int, default=4096, help="Sub-batch size for SAE forward pass")
     p.add_argument("--num_workers",    type=int, default=4,    help="DataLoader worker processes")
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip shards already merged into checkpoint state in out_dir.",
+    )
     return p.parse_args()
+
+
+FIND_TOP_RESUME = ".find_top_activations_resume.pt"
+
+
+def _ft_shard_key(embed_dir: str, shard_path: str) -> str:
+    root = os.path.normpath(os.path.abspath(embed_dir))
+    sp = os.path.normpath(os.path.abspath(shard_path))
+    try:
+        return os.path.relpath(sp, root)
+    except ValueError:
+        return sp
+
+
+def _ft_plan_sha(keys: List[str]) -> str:
+    h = hashlib.sha256()
+    h.update("\n".join(keys).encode())
+    return h.hexdigest()
+
+
+def _ft_fingerprint(
+    sae_checkpoint: str,
+    embed_dir: str,
+    splits: List[str],
+    layer: int,
+    top_n: int,
+    dict_size: int,
+    plan_sha: str,
+) -> dict:
+    h = hashlib.sha256()
+    h.update(os.path.normpath(os.path.abspath(sae_checkpoint)).encode())
+    return {
+        "sae_checkpoint_sha256": h.hexdigest(),
+        "embed_dir":             os.path.normpath(os.path.abspath(embed_dir)),
+        "splits":                list(splits),
+        "layer":                 layer,
+        "top_n":                 top_n,
+        "dict_size":             dict_size,
+        "shard_plan_sha256":     plan_sha,
+    }
+
+
+def _ft_fp_match(a: dict, b: dict) -> bool:
+    keys = (
+        "sae_checkpoint_sha256", "embed_dir", "splits", "layer",
+        "top_n", "dict_size", "shard_plan_sha256",
+    )
+    return all(a.get(k) == b.get(k) for k in keys)
+
+
+def _ft_collect_plan(embed_dir: str, splits: List[str], layer: int) -> List[Tuple[str, str]]:
+    plan: List[Tuple[str, str]] = []
+    for split in splits:
+        layer_dir   = os.path.join(embed_dir, split, f"layer_{layer}")
+        shard_paths = sorted(glob.glob(os.path.join(layer_dir, "shard_*.pt")))
+        for sp in shard_paths:
+            plan.append((split, sp))
+    return plan
+
+
+def _ft_save_resume(out_dir: str, payload: dict) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, FIND_TOP_RESUME)
+    tmp = path + ".tmp"
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
+def _ft_clear_resume(out_dir: str) -> None:
+    p = os.path.join(out_dir, FIND_TOP_RESUME)
+    if os.path.isfile(p):
+        os.remove(p)
 
 
 def main():
@@ -452,35 +534,99 @@ def main():
     cfg = restore_cfg_types(cfg)
     cfg["device"] = args.device
 
-    print(f"Loading SAE from {args.sae_checkpoint} ...")
-    sae        = load_sae(cfg, args.sae_checkpoint, args.device)
     n_features = cfg["dict_size"]
     act_size   = cfg["act_size"]
-    print(f"SAE: dict_size={n_features}, act_size={act_size}")
-    print(f"Scanning splits: {args.splits}  |  top_n={args.top_n}")
 
-    # Single accumulator across all splits  (optimization #2)
+    shard_plan = _ft_collect_plan(args.embed_dir, args.splits, args.layer)
+    plan_keys  = [_ft_shard_key(args.embed_dir, p) for _, p in shard_plan]
+    plan_sha   = _ft_plan_sha(plan_keys)
+    fp_exp     = _ft_fingerprint(
+        args.sae_checkpoint, args.embed_dir, args.splits,
+        args.layer, args.top_n, n_features, plan_sha,
+    )
+
+    resume_path = os.path.join(args.out_dir, FIND_TOP_RESUME)
+    done_keys: Set[str] = set()
     accumulator    = TensorTopN(n_features, args.top_n, device=args.device)
     shard_registry: List[dict] = []
 
+    if args.resume and os.path.isfile(resume_path):
+        blob = torch.load(resume_path, map_location="cpu")
+        if not _ft_fp_match(blob.get("fingerprint", {}), fp_exp):
+            print("[resume] Fingerprint mismatch — ignoring saved partial state.")
+        else:
+            done_keys = set(blob.get("completed_shard_keys", [])) & set(plan_keys)
+            reg = blob.get("shard_registry", [])
+            if isinstance(reg, list) and len(reg) == len(done_keys):
+                shard_registry = reg
+                accumulator.vals = blob["vals"].to(args.device)
+                accumulator.tok_idxs = blob["tok_idxs"].to(args.device)
+                accumulator.shard_ids = blob["shard_ids"].to(args.device)
+                print(f"[resume] Loaded partial top-k state: {len(done_keys)}/{len(plan_keys)} shards.")
+            else:
+                print("[resume] Invalid registry length vs completed shards — starting fresh.")
+                done_keys = set()
+                shard_registry = []
+
+    pt_out = os.path.join(args.out_dir, "top_activations.pt")
+    if (
+        args.resume
+        and plan_keys
+        and len(done_keys) >= len(plan_keys)
+        and os.path.isfile(pt_out)
+    ):
+        print("[resume] All shards already processed and top_activations.pt exists — exiting.")
+        return
+
+    print(f"Loading SAE from {args.sae_checkpoint} ...")
+    sae = load_sae(cfg, args.sae_checkpoint, args.device)
+    print(f"SAE: dict_size={n_features}, act_size={act_size}")
+    print(f"Scanning splits: {args.splits}  |  top_n={args.top_n}")
+
     for split in args.splits:
-        layer_dir   = os.path.join(args.embed_dir, split, f"layer_{args.layer}")
-        shard_paths = sorted(glob.glob(os.path.join(layer_dir, "shard_*.pt")))
-        if not shard_paths:
+        layer_dir = os.path.join(args.embed_dir, split, f"layer_{args.layer}")
+        if not glob.glob(os.path.join(layer_dir, "shard_*.pt")):
             print(f"  [WARNING] No shards found in {layer_dir}, skipping.")
-            continue
-        print(f"\nProcessing {split}: {len(shard_paths)} shards in {layer_dir}")
-        process_shards(
-            sae=sae,
-            shard_paths=shard_paths,
-            split_name=split,
-            accumulator=accumulator,
-            batch_size=args.batch_size,
-            act_size=act_size,
-            device=args.device,
-            num_workers=args.num_workers,
-            shard_registry=shard_registry,
-        )
+
+    remaining: List[Tuple[str, str]] = [
+        (sp, pth) for sp, pth in shard_plan
+        if _ft_shard_key(args.embed_dir, pth) not in done_keys
+    ]
+    if remaining:
+        print(f"\nProcessing {len(remaining)} remaining shard(s) (of {len(shard_plan)})")
+
+        def _persist(shard_path: str) -> None:
+            if not args.resume:
+                return
+            done_keys.add(_ft_shard_key(args.embed_dir, shard_path))
+            _ft_save_resume(
+                args.out_dir,
+                {
+                    "fingerprint": fp_exp,
+                    "completed_shard_keys": sorted(done_keys),
+                    "shard_registry": shard_registry,
+                    "vals": accumulator.vals.cpu(),
+                    "tok_idxs": accumulator.tok_idxs.cpu(),
+                    "shard_ids": accumulator.shard_ids.cpu(),
+                },
+            )
+
+        by_split: dict[str, List[str]] = {}
+        for sp, pth in remaining:
+            by_split.setdefault(sp, []).append(pth)
+        for split_name, shard_paths in by_split.items():
+            process_shards(
+                sae=sae,
+                shard_paths=shard_paths,
+                split_name=split_name,
+                accumulator=accumulator,
+                batch_size=args.batch_size,
+                act_size=act_size,
+                device=args.device,
+                num_workers=args.num_workers,
+                shard_registry=shard_registry,
+                after_shard=_persist if args.resume else None,
+            )
 
     print("\nSaving results ...")
     save_results(
@@ -490,6 +636,8 @@ def main():
         layer          = args.layer,
         out_dir        = args.out_dir,
     )
+    if args.resume:
+        _ft_clear_resume(args.out_dir)
     print("Done.")
 
 

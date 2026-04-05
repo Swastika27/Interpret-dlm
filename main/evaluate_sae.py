@@ -46,11 +46,14 @@ Sequences format (for fidelity only):
 """
 
 import glob
+import hashlib
+import json
 import os
+import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List, Set, Tuple
 
 try:
     from pyfaidx import Fasta
@@ -63,7 +66,6 @@ import torch
 import torch.nn.functional as F
 import yaml
 from tqdm import tqdm
-import json
 
 from SAE_training.sae import (
     BatchTopKSAE,
@@ -230,6 +232,72 @@ def iter_shard_batches(
     if buffer is not None and buffer.shape[0] > 0:
         yield buffer.to(device)
 
+
+def _eval_resume_dir(output_file: Path) -> Path:
+    return output_file.parent / f".evaluate_sae_resume_{output_file.stem}"
+
+
+def _eval_paths_sha(paths: List[Path]) -> str:
+    h = hashlib.sha256()
+    for p in paths:
+        h.update(str(p.resolve()).encode())
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def _eval_split_fingerprint(
+    sae_path: str,
+    cfg_path: str,
+    embed_dir: Path,
+    eval_batch_size: int,
+    paths_sha: str,
+) -> dict:
+    h = hashlib.sha256()
+    h.update(os.path.normpath(os.path.abspath(sae_path)).encode())
+    h.update(os.path.normpath(os.path.abspath(cfg_path)).encode())
+    return {
+        "sae_cfg_sha256": h.hexdigest(),
+        "embed_dir":    str(Path(embed_dir).resolve()),
+        "eval_batch_size": eval_batch_size,
+        "shard_paths_sha256": paths_sha,
+    }
+
+
+def _eval_fp_match(a: dict, b: dict) -> bool:
+    keys = ("sae_cfg_sha256", "embed_dir", "eval_batch_size", "shard_paths_sha256")
+    return all(a.get(k) == b.get(k) for k in keys)
+
+
+def _eval_save_resume_tmp(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
+def _eval_fidelity_fingerprint(
+    split_fp: dict,
+    bed_path: Path,
+    hyenadna_checkpoint_path: str,
+    layer_idx: int,
+    fidelity_max_seq_len: int,
+) -> dict:
+    out = dict(split_fp)
+    out["bed_path"] = str(Path(bed_path).resolve())
+    out["hyenadna_checkpoint_path"] = hyenadna_checkpoint_path
+    out["layer_idx"] = int(layer_idx)
+    out["fidelity_max_seq_len"] = int(fidelity_max_seq_len)
+    return out
+
+
+def _eval_fid_match(a: dict, b: dict) -> bool:
+    keys = (
+        "sae_cfg_sha256", "embed_dir", "eval_batch_size", "shard_paths_sha256",
+        "split", "bed_path", "hyenadna_checkpoint_path", "layer_idx",
+        "fidelity_max_seq_len",
+    )
+    return all(a.get(k) == b.get(k) for k in keys)
+
 # --------------------------------------------------------------------------
 # Read BED coordinates
 # --------------------------------------------------------------------------
@@ -324,6 +392,9 @@ def calculate_reconstruction_metrics(
     shard_paths: List[Path],
     batch_size: int = 4096,
     device: str = "cpu",
+    resume: bool = False,
+    resume_path: Optional[Path] = None,
+    split_fp: Optional[dict] = None,
 ) -> dict:
     """
     Calculate reconstruction quality metrics in mini-batches to avoid OOM.
@@ -336,9 +407,12 @@ def calculate_reconstruction_metrics(
         shard_paths: Ordered list of shard .pt file paths.
         batch_size:  Tokens processed per forward pass.
         device:      Torch device string.
+        resume:      If True, load/save per-shard progress under resume_path.
+        resume_path: File to store reconstruction accumulator state.
+        split_fp:    Fingerprint dict validated against saved checkpoints.
 
     Returns:
-        dict with mse, variance_explained, per-dimension MSE stats.
+        dict with mse, variance_explained, per-dimension MSE stats, n_tokens.
     """
     d_model = None
 
@@ -352,31 +426,79 @@ def calculate_reconstruction_metrics(
     sq_err_sum  = torch.tensor(0.0)   # scalar accumulators (CPU)
     per_dim_mse_sum = None            # [d_model]
 
+    completed: Set[str] = set()
+    if (
+        resume
+        and resume_path is not None
+        and split_fp is not None
+        and resume_path.is_file()
+    ):
+        blob = torch.load(resume_path, map_location="cpu")
+        if _eval_fp_match(blob.get("fingerprint", {}), split_fp):
+            completed = set(blob.get("completed_shards", []))
+            st = blob.get("state", {})
+            if st and int(st.get("n_total", 0)) > 0:
+                d_model = int(st["d_model"])
+                n_total = int(st["n_total"])
+                x_mean  = st["x_mean"].cpu().float()
+                x_M2    = st["x_M2"].cpu().float()
+                res_mean = st["res_mean"].cpu().float()
+                res_M2   = st["res_M2"].cpu().float()
+                sq_err_sum = st["sq_err_sum"].cpu().float()
+                per_dim_mse_sum = st["per_dim_mse_sum"].cpu().float()
+                print(f"  [resume] Reconstruction: {len(completed)}/{len(shard_paths)} shards already done.")
+        else:
+            completed = set()
+
     with torch.no_grad():
-        for batch in tqdm(
-            iter_shard_batches(shard_paths, batch_size, device=device),
-            desc="Reconstruction",
-            leave=False,
-        ):
-            recon, acts    = sae(batch)
-            residual = batch - recon         # [b, d_model]
-            b        = batch.shape[0]
+        for sp in shard_paths:
+            key = str(sp.resolve())
+            if key in completed:
+                continue
+            for batch in tqdm(
+                iter_shard_batches([sp], batch_size, device=device),
+                desc="Reconstruction",
+                leave=False,
+            ):
+                recon, acts    = sae(batch)
+                residual = batch - recon         # [b, d_model]
+                b        = batch.shape[0]
 
-            if d_model is None:
-                d_model      = batch.shape[1]
-                x_mean       = torch.zeros(d_model)
-                x_M2         = torch.zeros(d_model)
-                res_mean     = torch.zeros(d_model)
-                res_M2       = torch.zeros(d_model)
-                per_dim_mse_sum = torch.zeros(d_model)
+                if d_model is None:
+                    d_model      = batch.shape[1]
+                    x_mean       = torch.zeros(d_model)
+                    x_M2         = torch.zeros(d_model)
+                    res_mean     = torch.zeros(d_model)
+                    res_M2       = torch.zeros(d_model)
+                    per_dim_mse_sum = torch.zeros(d_model)
 
-            # Accumulate MSE
-            sq_err_sum      += (residual ** 2).sum().cpu()
-            per_dim_mse_sum += (residual ** 2).sum(dim=0).cpu()
+                # Accumulate MSE
+                sq_err_sum      += (residual ** 2).sum().cpu()
+                per_dim_mse_sum += (residual ** 2).sum(dim=0).cpu()
 
-            # Accumulate variance statistics (on CPU)
-            n_total, x_mean, x_M2     = _update_welford(n_total, x_mean, x_M2,     batch.cpu())
-            _,       res_mean, res_M2 = _update_welford(n_total - b, res_mean, res_M2, residual.cpu())
+                # Accumulate variance statistics (on CPU)
+                n_total, x_mean, x_M2     = _update_welford(n_total, x_mean, x_M2,     batch.cpu())
+                _,       res_mean, res_M2 = _update_welford(n_total - b, res_mean, res_M2, residual.cpu())
+
+            completed.add(key)
+            if resume and resume_path is not None and split_fp is not None and d_model is not None:
+                _eval_save_resume_tmp(
+                    resume_path,
+                    {
+                        "fingerprint": split_fp,
+                        "completed_shards": sorted(completed),
+                        "state": {
+                            "d_model": d_model,
+                            "n_total": n_total,
+                            "x_mean": x_mean.cpu(),
+                            "x_M2": x_M2.cpu(),
+                            "res_mean": res_mean.cpu(),
+                            "res_M2": res_M2.cpu(),
+                            "sq_err_sum": sq_err_sum.cpu(),
+                            "per_dim_mse_sum": per_dim_mse_sum.cpu(),
+                        },
+                    },
+                )
 
     if n_total == 0:
         raise RuntimeError("No tokens were processed — check shard_paths.")
@@ -394,6 +516,7 @@ def calculate_reconstruction_metrics(
         "per_dim_mse_mean": per_dim_mse.mean().item(),
         "per_dim_mse_std":  per_dim_mse.std().item(),
         "per_dim_mse_max":  per_dim_mse.max().item(),
+        "n_tokens": int(n_total),
     }
 
 
@@ -402,6 +525,9 @@ def calculate_sparsity_metrics(
     shard_paths: List[Path],
     batch_size: int = 4096,
     device: str = "cpu",
+    resume: bool = False,
+    resume_path: Optional[Path] = None,
+    split_fp: Optional[dict] = None,
 ) -> dict:
     """
     Calculate sparsity metrics in mini-batches to avoid OOM.
@@ -414,29 +540,75 @@ def calculate_sparsity_metrics(
         shard_paths: Ordered list of shard .pt file paths.
         batch_size:  Tokens processed per forward pass.
         device:      Torch device string.
+        resume:      If True, load/save per-shard progress under resume_path.
+        resume_path: File to store sparsity accumulator state.
+        split_fp:    Fingerprint dict validated against saved checkpoints.
 
     Returns:
-        dict with L0, dead features, highly active features, etc.
+        dict with L0, dead features, highly active features, etc., and n_tokens.
     """
     n_total         = 0
     l0_sum          = 0.0
     feature_act_sum = None   # [dict_size] — accumulated on CPU
 
+    completed: Set[str] = set()
+    if (
+        resume
+        and resume_path is not None
+        and split_fp is not None
+        and resume_path.is_file()
+    ):
+        blob = torch.load(resume_path, map_location="cpu")
+        if _eval_fp_match(blob.get("fingerprint", {}), split_fp):
+            completed = set(blob.get("completed_shards", []))
+            st = blob.get("state", {})
+            if st and int(st.get("n_total", 0)) > 0:
+                n_total = int(st["n_total"])
+                l0_sum  = float(st["l0_sum"])
+                feature_act_sum = st["feature_act_sum"].cpu().float()
+                print(f"  [resume] Sparsity: {len(completed)}/{len(shard_paths)} shards already done.")
+        else:
+            completed = set()
+
     with torch.no_grad():
-        for batch in tqdm(
-            iter_shard_batches(shard_paths, batch_size, device=device),
-            desc="Sparsity",
-            leave=False,
-        ):
-            recon, acts = sae(batch)   # [b, dict_size]
-            active   = (acts != 0)     # [b, dict_size] bool
+        for sp in shard_paths:
+            key = str(sp.resolve())
+            if key in completed:
+                continue
+            for batch in tqdm(
+                iter_shard_batches([sp], batch_size, device=device),
+                desc="Sparsity",
+                leave=False,
+            ):
+                recon, acts = sae(batch)   # [b, dict_size]
+                active   = (acts != 0)     # [b, dict_size] bool
 
-            if feature_act_sum is None:
-                feature_act_sum = torch.zeros(acts.shape[1])
+                if feature_act_sum is None:
+                    feature_act_sum = torch.zeros(acts.shape[1])
 
-            l0_sum          += active.float().sum(dim=-1).sum().item()
-            feature_act_sum += active.float().sum(dim=0).cpu()
-            n_total         += batch.shape[0]
+                l0_sum          += active.float().sum(dim=-1).sum().item()
+                feature_act_sum += active.float().sum(dim=0).cpu()
+                n_total         += batch.shape[0]
+
+            completed.add(key)
+            if (
+                resume
+                and resume_path is not None
+                and split_fp is not None
+                and feature_act_sum is not None
+            ):
+                _eval_save_resume_tmp(
+                    resume_path,
+                    {
+                        "fingerprint": split_fp,
+                        "completed_shards": sorted(completed),
+                        "state": {
+                            "n_total": n_total,
+                            "l0_sum": l0_sum,
+                            "feature_act_sum": feature_act_sum.cpu(),
+                        },
+                    },
+                )
 
     if n_total == 0:
         raise RuntimeError("No tokens were processed — check shard_paths.")
@@ -454,6 +626,7 @@ def calculate_sparsity_metrics(
         "highly_active_features": int(highly_active),
         "highly_active_pct": (highly_active / sae.dict_size) * 100,
         "mean_feature_activation_freq": feature_active.mean().item() * 100,
+        "n_tokens": int(n_total),
     }
 
 
@@ -726,6 +899,7 @@ def evaluate_sae(
     layer_idx: Optional[int] = None,
     fidelity_batch_size: int = 4,
     fidelity_max_seq_len: int = 1024,
+    resume: bool = False,
 ):
     """
     Evaluate SAE on pre-saved val and test embeddings stored as sharded .pt files.
@@ -751,6 +925,8 @@ def evaluate_sae(
         layer_idx: Layer to patch for fidelity evaluation
         fidelity_batch_size: Batch size for fidelity (unused, kept for future batching)
         fidelity_max_seq_len: Truncate sequences to this length for fidelity eval
+        resume: Skip embedding shards (and cached fidelity) already processed;
+                requires --output_file. State lives beside the YAML output.
     """
 
     run_fidelity = all([
@@ -790,6 +966,11 @@ def evaluate_sae(
     sae = load_sae(cfg, checkpoint_path=sae_path, device=device_str)
     print(f"SAE: {cfg['dict_size']} features, {cfg['act_size']}D\n")
 
+    use_resume = bool(resume and output_file)
+    if resume and not output_file:
+        print("⚠️  --resume ignored without --output_file (no resume directory).")
+    resume_dir = _eval_resume_dir(Path(output_file)) if use_resume else None
+
     results = {
         "sae_path": str(sae_path),
         "val_embeddings_path": str(val_embeddings_path),
@@ -816,21 +997,30 @@ def evaluate_sae(
         shard_paths = get_shard_paths(Path(emb_dir))
         print(f"\nFound {len(shard_paths)} shard(s) in {emb_dir}")
 
-        # Count total tokens without loading everything into memory
-        n_tokens = sum(
-            (lambda e: e.shape[0] * e.shape[1] if e.ndim == 3 else e.shape[0])(
-                torch.load(p, map_location="cpu")["emb"]
-            )
-            for p in tqdm(shard_paths, desc="Counting tokens", leave=False)
+        paths_sha = _eval_paths_sha(shard_paths)
+        split_fp = _eval_split_fingerprint(
+            sae_path, cfg_path, Path(emb_dir), eval_batch_size, paths_sha
         )
-        results[split_name] = {"n_tokens": n_tokens}
-        print(f"  Total tokens: {n_tokens:,}")
+        split_fp["split"] = split_name
+
+        recon_pt = (resume_dir / f"{split_name}_recon.pt") if resume_dir else None
+        sparse_pt = (resume_dir / f"{split_name}_sparsity.pt") if resume_dir else None
+        fid_pt = (resume_dir / f"{split_name}_fidelity.pt") if resume_dir else None
 
         # 1. Reconstruction
         print(f"\n--- 1. Reconstruction Quality ({split_name}) ---")
         recon_metrics = calculate_reconstruction_metrics(
-            sae, shard_paths, batch_size=eval_batch_size, device=device_str
+            sae,
+            shard_paths,
+            batch_size=eval_batch_size,
+            device=device_str,
+            resume=use_resume,
+            resume_path=recon_pt,
+            split_fp=split_fp,
         )
+        n_tokens = int(recon_metrics.pop("n_tokens"))
+        results[split_name] = {"n_tokens": n_tokens}
+        print(f"  Total tokens: {n_tokens:,}")
         results[split_name]["reconstruction"] = recon_metrics
         for k, v in recon_metrics.items():
             print(f"  {k}: {v:.6f}")
@@ -838,36 +1028,66 @@ def evaluate_sae(
         # 2. Sparsity
         print(f"\n--- 2. Sparsity ({split_name}) ---")
         sparsity_metrics = calculate_sparsity_metrics(
-            sae, shard_paths, batch_size=eval_batch_size, device=device_str
+            sae,
+            shard_paths,
+            batch_size=eval_batch_size,
+            device=device_str,
+            resume=use_resume,
+            resume_path=sparse_pt,
+            split_fp=split_fp,
         )
+        sparsity_metrics.pop("n_tokens", None)
         results[split_name]["sparsity"] = sparsity_metrics
         for k, v in sparsity_metrics.items():
             fmt = f"{v:.2f}%" if ("pct" in k or "freq" in k) else str(v)
             print(f"  {k}: {fmt}")
 
-        
         # 3. Fidelity
         if run_fidelity:
             print(f"\n--- 3. Fidelity — Loss Recovered ({split_name}) ---")
-            print("  Patching HyenaDNA activations with SAE reconstructions...")
-
-            genome = Fasta(genome_path, as_raw=True, sequence_always_upper=True)
-
-            fidelity_eval = HyenaDNAFidelityEvaluator(
-                checkpoint_path=hyenadna_checkpoint_path,
-                bed_path=str(bed_path),
-                genome=genome,
-                layer_idx=layer_idx,
-                batch_size=fidelity_batch_size,
-                max_seq_len=fidelity_max_seq_len,
-                device=device_str,
+            fid_fp = _eval_fidelity_fingerprint(
+                split_fp,
+                Path(bed_path),
+                hyenadna_checkpoint_path,
+                layer_idx,
+                fidelity_max_seq_len,
             )
-            fidelity_metrics = fidelity_eval.calculate_fidelity(sae)
-            results[split_name]["fidelity"] = fidelity_metrics
+            loaded_fid = False
+            if use_resume and fid_pt is not None and fid_pt.is_file():
+                blob = torch.load(fid_pt, map_location="cpu")
+                if _eval_fid_match(blob.get("fingerprint", {}), fid_fp):
+                    results[split_name]["fidelity"] = blob["metrics"]
+                    loaded_fid = True
+                    print("  [resume] Fidelity metrics loaded from cache.")
+                    for k, v in results[split_name]["fidelity"].items():
+                        fmt = f"{v:.2f}%" if "pct" in k else f"{v:.6f}"
+                        print(f"  {k}: {fmt}")
 
-            for k, v in fidelity_metrics.items():
-                fmt = f"{v:.2f}%" if "pct" in k else f"{v:.6f}"
-                print(f"  {k}: {fmt}")
+            if not loaded_fid:
+                print("  Patching HyenaDNA activations with SAE reconstructions...")
+                genome = Fasta(genome_path, as_raw=True, sequence_always_upper=True)
+
+                fidelity_eval = HyenaDNAFidelityEvaluator(
+                    checkpoint_path=hyenadna_checkpoint_path,
+                    bed_path=str(bed_path),
+                    genome=genome,
+                    layer_idx=layer_idx,
+                    batch_size=fidelity_batch_size,
+                    max_seq_len=fidelity_max_seq_len,
+                    device=device_str,
+                )
+                fidelity_metrics = fidelity_eval.calculate_fidelity(sae)
+                results[split_name]["fidelity"] = fidelity_metrics
+
+                for k, v in fidelity_metrics.items():
+                    fmt = f"{v:.2f}%" if "pct" in k else f"{v:.6f}"
+                    print(f"  {k}: {fmt}")
+
+                if use_resume and fid_pt is not None:
+                    _eval_save_resume_tmp(
+                        fid_pt,
+                        {"fingerprint": fid_fp, "metrics": fidelity_metrics},
+                    )
         else:
             results[split_name]["fidelity"] = "skipped"
             print(f"\n--- 3. Fidelity ({split_name}): SKIPPED ---")
@@ -886,6 +1106,8 @@ def evaluate_sae(
         with open(output_file, "w") as f:
             yaml.dump(results, f, default_flow_style=False)
         print(f"Results saved to: {output_file}")
+        if use_resume and resume_dir is not None and resume_dir.is_dir():
+            shutil.rmtree(resume_dir, ignore_errors=True)
     else:
         print(yaml.dump(results, default_flow_style=False))
 
@@ -924,6 +1146,11 @@ def parse_args():
     parser.add_argument("--layer_idx", type=int, default=None)
     parser.add_argument("--fidelity_batch_size", type=int, default=4)
     parser.add_argument("--fidelity_max_seq_len", type=int, default=1024)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip embedding shards already merged (and cached fidelity). Requires --output_file.",
+    )
 
     return parser.parse_args()
 
@@ -945,4 +1172,5 @@ if __name__ == "__main__":
         layer_idx=args.layer_idx,
         fidelity_batch_size=args.fidelity_batch_size,
         fidelity_max_seq_len=args.fidelity_max_seq_len,
+        resume=args.resume,
     )

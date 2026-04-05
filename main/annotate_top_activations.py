@@ -13,9 +13,10 @@ import argparse
 import csv
 import itertools
 import os
-from collections import defaultdict
+import re
 from pathlib import Path
 
+import numpy as np
 import torch
 import pybedtools
 
@@ -28,7 +29,6 @@ def load_top_activations(pt_path: str):
     data = torch.load(pt_path, map_location="cpu")
     return data["coords"], data["act_values"]
 
-import re
 
 def normalise_chrom_convention(bed: pybedtools.BedTool) -> pybedtools.BedTool:
     """
@@ -179,6 +179,40 @@ def count_pairwise_per_feature(
     return result
 
 
+def pairwise_cells_one_pair(
+    all_tokens_bed: pybedtools.BedTool,
+    bed_a: pybedtools.BedTool,
+    bed_b: pybedtools.BedTool,
+    n_features: int,
+) -> dict[str, list[int]]:
+    """Venn-style counts for one concept pair (same semantics as count_pairwise loop body)."""
+    a_only  = [0] * n_features
+    b_only  = [0] * n_features
+    both    = [0] * n_features
+
+    if len(all_tokens_bed) == 0:
+        return {"A_only": a_only, "B_only": b_only, "both": both}
+
+    in_a = all_tokens_bed.intersect(bed_a, u=True)
+    if len(in_a) > 0:
+        in_ab = in_a.intersect(bed_b, u=True)
+        for interval in in_ab:
+            both[int(interval.name)] += 1
+
+    if len(in_a) > 0:
+        in_a_not_b = in_a.intersect(bed_b, v=True)
+        for interval in in_a_not_b:
+            a_only[int(interval.name)] += 1
+
+    in_b = all_tokens_bed.intersect(bed_b, u=True)
+    if len(in_b) > 0:
+        in_b_not_a = in_b.intersect(bed_a, v=True)
+        for interval in in_b_not_a:
+            b_only[int(interval.name)] += 1
+
+    return {"A_only": a_only, "B_only": b_only, "both": both}
+
+
 # ---------------------------------------------------------------------------
 # Write CSVs
 # ---------------------------------------------------------------------------
@@ -257,7 +291,37 @@ def parse_args():
     p.add_argument("--bed_dir",         required=True)
     p.add_argument("--out_dir",         required=True)
     p.add_argument("--tmp_dir",         default="/tmp/pybedtools")
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reuse cached per-concept / pairwise intersections in out_dir when present.",
+    )
     return p.parse_args()
+
+
+ANNOT_CACHE_DIR = ".annotate_resume"
+
+
+def _safe_cache_token(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+
+
+def _annotate_cache_paths(out_dir: str) -> str:
+    return os.path.join(out_dir, ANNOT_CACHE_DIR)
+
+
+def _annotate_clear_cache(cache_dir: str) -> None:
+    if not os.path.isdir(cache_dir):
+        return
+    for fn in os.listdir(cache_dir):
+        try:
+            os.remove(os.path.join(cache_dir, fn))
+        except OSError:
+            pass
+    try:
+        os.rmdir(cache_dir)
+    except OSError:
+        pass
 
 
 def main():
@@ -267,6 +331,13 @@ def main():
     os.makedirs(args.tmp_dir, exist_ok=True)
     os.chmod(args.tmp_dir, 0o777)
     pybedtools.set_tempdir(args.tmp_dir)
+
+    enrich_path = os.path.join(args.out_dir, "enrichment.csv")
+    venn_path   = os.path.join(args.out_dir, "venn.csv")
+    cache_dir   = _annotate_cache_paths(args.out_dir)
+    if args.resume and os.path.isfile(enrich_path) and os.path.isfile(venn_path):
+        print("[resume] enrichment.csv and venn.csv already exist — exiting.")
+        return
 
     print(f"Loading {args.top_activations} ...")
     coords, act_values = load_top_activations(args.top_activations)
@@ -318,30 +389,77 @@ def main():
         bp.stem: normalise_to(pybedtools.BedTool(str(bp)).sort(), tokens_use_chr)
         for bp in bed_paths
     }
+    if args.resume:
+        os.makedirs(cache_dir, exist_ok=True)
+        os.chmod(cache_dir, 0o777)
+
     # One intersect per concept
     print("Intersecting with concept BEDs ...")
     per_concept_hits: dict[str, list[int]] = {}
     for name, bed in concept_beds.items():
+        hit_np = os.path.join(cache_dir, f"hits_{_safe_cache_token(name)}.npy")
+        if args.resume and os.path.isfile(hit_np):
+            print(f"  {name} ... [resume: cached]")
+            per_concept_hits[name] = np.load(hit_np).astype(int).tolist()
+            continue
         print(f"  {name} ...")
-        per_concept_hits[name] = count_hits_per_feature(all_tokens_bed, bed, n_features)
+        hits = count_hits_per_feature(all_tokens_bed, bed, n_features)
+        per_concept_hits[name] = hits
+        if args.resume:
+            np.save(hit_np, np.asarray(hits, dtype=np.int64))
 
     # Neither: one intersect against merged union
-    print("Computing 'neither' ...")
-    neither = count_neither_per_feature(all_tokens_bed, concept_beds, n_features)
+    neither_np = os.path.join(cache_dir, "neither.npy")
+    if args.resume and os.path.isfile(neither_np):
+        print("Computing 'neither' ... [resume: cached]")
+        neither = np.load(neither_np).astype(int).tolist()
+    else:
+        print("Computing 'neither' ...")
+        neither = count_neither_per_feature(all_tokens_bed, concept_beds, n_features)
+        if args.resume:
+            np.save(neither_np, np.asarray(neither, dtype=np.int64))
 
     # Pairwise: two intersects per pair
     print(f"Computing {len(pairs)} pairwise intersections ...")
-    pairwise_hits = count_pairwise_per_feature(all_tokens_bed, concept_beds, n_features)
+    pairwise_hits: dict[tuple, dict[str, list[int]]] = {}
+    for a, b in pairs:
+        pw_np = os.path.join(
+            cache_dir, f"pair__{_safe_cache_token(a)}__{_safe_cache_token(b)}.npz"
+        )
+        if args.resume and os.path.isfile(pw_np):
+            print(f"  pair ({a}, {b}) ... [resume: cached]")
+            z = np.load(pw_np)
+            pairwise_hits[(a, b)] = {
+                "A_only": z["A_only"].astype(int).tolist(),
+                "B_only": z["B_only"].astype(int).tolist(),
+                "both":   z["both"].astype(int).tolist(),
+            }
+            continue
+        print(f"  pair ({a}, {b}) ...")
+        bed_a = concept_beds[a]
+        bed_b = concept_beds[b]
+        cells = pairwise_cells_one_pair(all_tokens_bed, bed_a, bed_b, n_features)
+        pairwise_hits[(a, b)] = cells
+        if args.resume:
+            np.savez(
+                pw_np,
+                A_only=np.asarray(cells["A_only"], dtype=np.int64),
+                B_only=np.asarray(cells["B_only"], dtype=np.int64),
+                both=np.asarray(cells["both"], dtype=np.int64),
+            )
 
     # Write outputs
     write_enrichment(
-        os.path.join(args.out_dir, "enrichment.csv"),
+        enrich_path,
         n_features, n_totals, per_concept_hits, neither, concept_names,
     )
     write_venn(
-        os.path.join(args.out_dir, "venn.csv"),
+        venn_path,
         n_features, n_totals, per_concept_hits, pairwise_hits, neither, pairs,
     )
+
+    if args.resume:
+        _annotate_clear_cache(cache_dir)
 
     print("Done.")
     pybedtools.cleanup()

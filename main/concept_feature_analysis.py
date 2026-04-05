@@ -54,11 +54,12 @@ by scaling the accumulated negative counts down to match n_pos.
 import argparse
 import csv
 import glob
+import hashlib
 import json
 import os
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -489,7 +490,173 @@ def parse_args():
     p.add_argument("--batch_size",     type=int, default=2048)
     p.add_argument("--top_k_features", type=int, default=10)
     p.add_argument("--seed",           type=int, default=42)
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip shards already recorded in out_dir; skip writing concept CSVs that already exist.",
+    )
     return p.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Resume (shard checkpoints + optional per-concept output skip)
+# ---------------------------------------------------------------------------
+
+COFA_RESUME_JSON = ".concept_feature_analysis_resume.json"
+COFA_COUNTS_NPZ  = ".concept_feature_analysis_counts.npz"
+
+
+def _cofa_shard_key(save_dir: str, shard_path: str) -> str:
+    save_dir = os.path.normpath(os.path.abspath(save_dir))
+    shard_path = os.path.normpath(os.path.abspath(shard_path))
+    try:
+        return os.path.relpath(shard_path, save_dir)
+    except ValueError:
+        return shard_path
+
+
+def _cofa_shard_plan_sha(expected_keys: List[str]) -> str:
+    h = hashlib.sha256()
+    h.update("\n".join(expected_keys).encode())
+    return h.hexdigest()
+
+
+def _cofa_fingerprint(
+    sae_checkpoint: str,
+    bed_basenames: List[str],
+    splits: List[str],
+    layer: int,
+    dict_size: int,
+    n_concepts: int,
+    shard_plan_sha: str,
+) -> dict:
+    h = hashlib.sha256()
+    h.update(os.path.normpath(os.path.abspath(sae_checkpoint)).encode())
+    h.update("|".join(bed_basenames).encode())
+    return {
+        "sae_checkpoint_sha256": h.hexdigest(),
+        "bed_basenames":        bed_basenames,
+        "splits":               list(splits),
+        "layer":                layer,
+        "dict_size":            dict_size,
+        "n_concepts":           n_concepts,
+        "shard_plan_sha256":    shard_plan_sha,
+    }
+
+
+def _cofa_fingerprint_match(stored: dict, expected: dict) -> bool:
+    keys = (
+        "bed_basenames", "splits", "layer", "dict_size", "n_concepts",
+        "sae_checkpoint_sha256", "shard_plan_sha256",
+    )
+    return all(stored.get(k) == expected.get(k) for k in keys)
+
+
+def _cofa_load_counts_npz(path: str, n_concepts: int, dict_size: int) -> Optional[dict]:
+    if not os.path.isfile(path):
+        return None
+    z = np.load(path)
+    try:
+        pos_acts = z["pos_acts"]
+        neg_acts = z["neg_acts"]
+        n_pos    = z["n_pos"]
+        n_neg    = z["n_neg"]
+    except KeyError:
+        return None
+    if pos_acts.shape != (n_concepts, dict_size) or neg_acts.shape != (n_concepts, dict_size):
+        return None
+    if n_pos.shape != (n_concepts,) or n_neg.shape != (n_concepts,):
+        return None
+    return {
+        "pos_acts": pos_acts.astype(np.int64, copy=True),
+        "neg_acts": neg_acts.astype(np.int64, copy=True),
+        "n_pos":    n_pos.astype(np.int64, copy=True),
+        "n_neg":    n_neg.astype(np.int64, copy=True),
+    }
+
+
+def _cofa_save_resume(out_dir: str, meta: dict, counts: dict) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+    json_path = os.path.join(out_dir, COFA_RESUME_JSON)
+    npz_path  = os.path.join(out_dir, COFA_COUNTS_NPZ)
+    tmp_json  = json_path + ".tmp"
+    tmp_npz   = npz_path + ".tmp"
+    with open(tmp_json, "w") as fh:
+        json.dump(meta, fh, indent=2)
+    np.savez(
+        tmp_npz,
+        pos_acts=counts["pos_acts"],
+        neg_acts=counts["neg_acts"],
+        n_pos=counts["n_pos"],
+        n_neg=counts["n_neg"],
+    )
+    os.replace(tmp_json, json_path)
+    os.replace(tmp_npz, npz_path)
+
+
+def _cofa_clear_resume(out_dir: str) -> None:
+    for name in (COFA_RESUME_JSON, COFA_COUNTS_NPZ):
+        p = os.path.join(out_dir, name)
+        if os.path.isfile(p):
+            os.remove(p)
+
+
+def _cofa_collect_shard_plan(save_dir: str, splits: List[str], layer: int) -> List[Tuple[str, str]]:
+    """Ordered (split, shard_path) for all shards that exist."""
+    plan: List[Tuple[str, str]] = []
+    for split in splits:
+        layer_dir   = os.path.join(save_dir, split, f"layer_{layer}")
+        shard_paths = sorted(glob.glob(os.path.join(layer_dir, "shard_*.pt")))
+        for sp in shard_paths:
+            plan.append((split, sp))
+    return plan
+
+
+def _cofa_concept_outputs_exist(out_dir: str, bed_names: List[str]) -> bool:
+    summary = os.path.join(out_dir, "summary.csv")
+    if not os.path.isfile(summary):
+        return False
+    for name in bed_names:
+        d = os.path.join(out_dir, name)
+        if not os.path.isfile(os.path.join(d, "all_features.csv")):
+            return False
+        if not os.path.isfile(os.path.join(d, "top_features.csv")):
+            return False
+    return True
+
+
+def _cofa_read_summary_row_from_top_csv(concept_dir: str) -> Optional[dict]:
+    top_path = os.path.join(concept_dir, "top_features.csv")
+    if not os.path.isfile(top_path):
+        return None
+    with open(top_path, newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    if not rows:
+        return None
+    best = rows[0]
+    summary_header = [
+        "concept", "best_feature_idx", "f1", "precision", "recall_tpr",
+        "tnr", "fpr", "fnr", "tp", "tn", "fp", "fn",
+        "n_positive_tokens", "baseline_prevalence",
+    ]
+    concept_name = os.path.basename(os.path.normpath(concept_dir))
+    out: dict = {"concept": concept_name}
+    for k in summary_header:
+        if k == "concept":
+            continue
+        src = k
+        if k == "best_feature_idx":
+            src = "best_feature_idx" if "best_feature_idx" in best else "feature_idx"
+        if src not in best:
+            return None
+        v = best[src]
+        if k == "best_feature_idx":
+            out[k] = int(float(v))
+        elif k in ("tp", "tn", "fp", "fn", "n_positive_tokens"):
+            out[k] = int(float(v))
+        else:
+            out[k] = float(v)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -499,14 +666,12 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # ---- Load config & SAE -------------------------------------------
+    # ---- Load config (SAE loaded only when shards still need work) ---
     with open(args.sae_cfg) as fh:
         cfg = json.load(fh)
     cfg = restore_cfg_types(cfg)
     cfg["device"] = args.device
 
-    print("Loading SAE ...")
-    sae       = load_sae(cfg, args.sae_checkpoint, args.device)
     act_size  = cfg["act_size"]
     dict_size = cfg["dict_size"]
 
@@ -517,36 +682,96 @@ def main():
     print(f"\nFound {len(bed_paths)} BED concept files:")
     bed_indices = [BEDIndex(p) for p in bed_paths]
     n_concepts  = len(bed_indices)
+    bed_basenames = [Path(p).name for p in bed_paths]
+
+    shard_plan = _cofa_collect_shard_plan(args.save_dir, args.splits, args.layer)
+    expected_keys = [_cofa_shard_key(args.save_dir, sp) for _, sp in shard_plan]
+    plan_sha = _cofa_shard_plan_sha(expected_keys)
+
+    fp_expected = _cofa_fingerprint(
+        args.sae_checkpoint, bed_basenames, args.splits, args.layer, dict_size, n_concepts, plan_sha
+    )
+
+    resume_json_path = os.path.join(args.out_dir, COFA_RESUME_JSON)
+    resume_npz_path  = os.path.join(args.out_dir, COFA_COUNTS_NPZ)
+    done_keys: Set[str] = set()
+    counts: dict = _make_counts(n_concepts, dict_size)
+
+    if args.resume and os.path.isfile(resume_json_path):
+        with open(resume_json_path) as fh:
+            meta = json.load(fh)
+        if not _cofa_fingerprint_match(meta.get("fingerprint", {}), fp_expected):
+            print("[resume] Fingerprint mismatch — starting counts from scratch.")
+        else:
+            loaded = _cofa_load_counts_npz(resume_npz_path, n_concepts, dict_size)
+            if loaded is None:
+                print("[resume] Missing or invalid counts file — starting from scratch.")
+            else:
+                counts = loaded
+                done_keys = set(meta.get("completed_shard_keys", [])) & set(expected_keys)
+                print(f"[resume] Loaded partial state: {len(done_keys)}/{len(expected_keys)} shards done.")
+
+    if (
+        args.resume
+        and expected_keys
+        and len(done_keys) >= len(expected_keys)
+        and _cofa_concept_outputs_exist(args.out_dir, [b.name for b in bed_indices])
+    ):
+        print("[resume] All shards and concept outputs already present — exiting.")
+        return
+
+    need_sae = False
+    for key in expected_keys:
+        if key not in done_keys:
+            need_sae = True
+            break
+    if need_sae:
+        print("Loading SAE ...")
+        sae = load_sae(cfg, args.sae_checkpoint, args.device)
+    else:
+        sae = None
+        print("[resume] All shards already accumulated — skipping SAE load.")
+
+    for split in args.splits:
+        layer_dir = os.path.join(args.save_dir, split, f"layer_{args.layer}")
+        if not glob.glob(os.path.join(layer_dir, "shard_*.pt")):
+            print(f"  [WARNING] No shards in {layer_dir}, skipping.")
 
     # ---- Streaming accumulation over all splits ----------------------
-    # Accumulators stay constant in memory regardless of dataset size:
-    #   2 x n_concepts x dict_size x 8 bytes  (int64)
-    # e.g. 20 concepts x 16384 features = ~5 MB total.
-    counts = _make_counts(n_concepts, dict_size)
-
     total_shards = 0
-    for split in args.splits:
-        layer_dir   = os.path.join(args.save_dir, split, f"layer_{args.layer}")
-        shard_paths = sorted(glob.glob(os.path.join(layer_dir, "shard_*.pt")))
-        if not shard_paths:
-            print(f"  [WARNING] No shards in {layer_dir}, skipping.")
+    for split, shard_path in tqdm(shard_plan, desc="  shards"):
+        sk = _cofa_shard_key(args.save_dir, shard_path)
+        if sk in done_keys:
             continue
-        print(f"\nStreaming {split}: {len(shard_paths)} shards")
-        for shard_path in tqdm(shard_paths, desc=f"  {split}"):
-            accumulate_shard(
-                sae         = sae,
-                shard_path  = shard_path,
-                bed_indices = bed_indices,
-                act_size    = act_size,
-                batch_size  = args.batch_size,
-                device      = args.device,
-                counts      = counts,
-            )
-            total_shards += 1
+        if not shard_path or not os.path.isfile(shard_path):
+            print(f"  [WARNING] Missing shard {shard_path}, skipping.")
+            continue
+        if sae is None:
+            raise RuntimeError("Internal error: need SAE for unfinished shards.")
+        print(f"\nStreaming {split}: {os.path.basename(shard_path)}")
+        accumulate_shard(
+            sae         = sae,
+            shard_path  = shard_path,
+            bed_indices = bed_indices,
+            act_size    = act_size,
+            batch_size  = args.batch_size,
+            device      = args.device,
+            counts      = counts,
+        )
+        total_shards += 1
+        done_keys.add(sk)
+        if args.resume:
+            meta = {
+                "fingerprint": fp_expected,
+                "completed_shard_keys": sorted(done_keys),
+            }
+            _cofa_save_resume(args.out_dir, meta, counts)
 
     # ---- Token / concept statistics ----------------------------------
     total_tokens = int(counts["n_pos"].sum() + counts["n_neg"].sum())
-    print(f"\nTotal tokens processed: {total_tokens:,}  ({total_shards} shards)")
+    n_shards_accounted = len(expected_keys) if expected_keys else len(done_keys)
+    extra = f", {total_shards} newly scanned this run" if total_shards else ""
+    print(f"\nTotal tokens processed: {total_tokens:,}  ({n_shards_accounted} shards{extra})")
     for ci, bed in enumerate(bed_indices):
         n_pos   = int(counts["n_pos"][ci])
         n_total = n_pos + int(counts["n_neg"][ci])
@@ -568,6 +793,16 @@ def main():
             print(f"\n  [WARNING] No positive tokens for '{bed.name}', skipping.")
             continue
 
+        concept_dir = os.path.join(args.out_dir, bed.name)
+        all_csv = os.path.join(concept_dir, "all_features.csv")
+        top_csv = os.path.join(concept_dir, "top_features.csv")
+        if args.resume and os.path.isfile(all_csv) and os.path.isfile(top_csv):
+            print(f"\n  [resume] Skipping '{bed.name}' — CSV outputs already exist.")
+            prev = _cofa_read_summary_row_from_top_csv(concept_dir)
+            if prev:
+                summary_rows.append(prev)
+            continue
+
         print(f"\n  Top {args.top_k_features} features for '{bed.name}':")
         print(f"  {'feat':>6}  {'F1':>6}  {'Prec':>6}  {'Rec/TPR':>8}  "
               f"{'TNR':>6}  {'FPR':>6}  {'FNR':>6}  "
@@ -583,7 +818,6 @@ def main():
                 f"{r['fp']:>6}  {r['fn']:>6}  {r['baseline_prevalence']:>14.4f}"
             )
 
-        concept_dir = os.path.join(args.out_dir, bed.name)
         os.makedirs(concept_dir, exist_ok=True)
         os.chmod(concept_dir, 0o777)
         write_feature_csv(os.path.join(concept_dir, "all_features.csv"), rows)
@@ -621,6 +855,9 @@ def main():
                 k: f"{row[k]:.6f}" if isinstance(row[k], float) else row[k]
                 for k in summary_header
             })
+
+    if args.resume:
+        _cofa_clear_resume(args.out_dir)
 
     print(f"\nDone. Results saved to {args.out_dir}/")
     print(f"  summary.csv                    – best feature per concept")
