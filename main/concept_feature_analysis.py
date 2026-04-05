@@ -19,6 +19,10 @@ Usage:
         --top_k_features  10 \
         --seed            42
 
+    Raw neurons (same pipeline; features = embedding dimensions, ReLU then acts > 0):
+
+    python concept_feature_analysis.py --raw_neurons --sae_cfg runs/my_run/cfg.json ...
+
 BED file format expected (tab-separated, 0-based half-open):
     chrom   chromStart   chromEnd   [name   score   strand   ...]
 
@@ -57,6 +61,7 @@ import glob
 import hashlib
 import json
 import os
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -77,6 +82,23 @@ from SAE_training.sae import (
     GatedSAE,
     GatedInferenceSAE,
 )
+
+
+class RawNeuronSAE(torch.nn.Module):
+    """
+    Drop-in replacement for a trained SAE that returns raw model activations.
+    The "features" are the neuron dimensions themselves (size = act_size).
+    Compatible with get_activations() since it does not use preprocess_input
+    or W_enc — the dedicated branch returns the input (after ReLU) as acts.
+    """
+    def __init__(self, act_size: int):
+        super().__init__()
+        self.act_size  = act_size
+        self.dict_size = act_size
+        self._dummy = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+
+    def forward(self, x):
+        return F.relu(x)
 
 
 def restore_cfg_types(cfg: dict) -> dict:
@@ -226,6 +248,9 @@ def get_activations(sae, x: torch.Tensor) -> torch.Tensor:
     dtype  = next(sae.parameters()).dtype
     device = next(sae.parameters()).device
     x = x.to(device=device, dtype=dtype)
+
+    if isinstance(sae, RawNeuronSAE):
+        return F.relu(x).float().cpu()
 
     if isinstance(sae, (JumpReLUInferenceSAE, GatedInferenceSAE)):
         _, acts = sae(x)
@@ -476,7 +501,11 @@ def write_feature_csv(path: str, rows: List[dict]):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--sae_checkpoint", required=True)
+    p.add_argument(
+        "--sae_checkpoint",
+        default=None,
+        help="Path to SAE .pt checkpoint (required unless --raw_neurons).",
+    )
     p.add_argument("--sae_cfg",        required=True)
     p.add_argument("--save_dir",       required=True,
                    help="Root dir with train/val/test splits of shards")
@@ -495,7 +524,16 @@ def parse_args():
         action="store_true",
         help="Skip shards already recorded in out_dir; skip writing concept CSVs that already exist.",
     )
-    return p.parse_args()
+    p.add_argument(
+        "--raw_neurons",
+        action="store_true",
+        help="Analyse raw model neurons (embedding dims) instead of SAE features; "
+             "uses ReLU so binarisation acts > 0 matches SAE convention.",
+    )
+    args = p.parse_args()
+    if not args.raw_neurons and not args.sae_checkpoint:
+        p.error("--sae_checkpoint is required unless --raw_neurons is set")
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -580,7 +618,9 @@ def _cofa_save_resume(out_dir: str, meta: dict, counts: dict) -> None:
     json_path = os.path.join(out_dir, COFA_RESUME_JSON)
     npz_path  = os.path.join(out_dir, COFA_COUNTS_NPZ)
     tmp_json  = json_path + ".tmp"
-    tmp_npz   = npz_path + ".tmp"
+    # np.savez appends ".npz" when the filename does not end with ".npz",
+    # so "*.npz.tmp" becomes "*.npz.tmp.npz" and os.replace fails (FileNotFoundError).
+    tmp_npz = (npz_path[:-4] + ".tmp.npz") if npz_path.endswith(".npz") else npz_path + ".tmp.npz"
     with open(tmp_json, "w") as fh:
         json.dump(meta, fh, indent=2)
     np.savez(
@@ -592,6 +632,30 @@ def _cofa_save_resume(out_dir: str, meta: dict, counts: dict) -> None:
     )
     os.replace(tmp_json, json_path)
     os.replace(tmp_npz, npz_path)
+    # #region agent log
+    try:
+        _logp = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "debug-64cfd6.log"))
+        with open(_logp, "a", encoding="utf-8") as _lf:
+            _lf.write(
+                json.dumps(
+                    {
+                        "sessionId": "64cfd6",
+                        "hypothesisId": "H1",
+                        "location": "concept_feature_analysis._cofa_save_resume",
+                        "message": "resume npz atomic save ok",
+                        "data": {
+                            "tmp_npz_used": tmp_npz,
+                            "final_npz_exists": os.path.isfile(npz_path),
+                            "wrong_legacy_name_exists": os.path.isfile(npz_path + ".tmp"),
+                        },
+                        "timestamp": int(time.time() * 1000),
+                    }
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+    # #endregion
 
 
 def _cofa_clear_resume(out_dir: str) -> None:
@@ -672,8 +736,17 @@ def main():
     cfg = restore_cfg_types(cfg)
     cfg["device"] = args.device
 
-    act_size  = cfg["act_size"]
-    dict_size = cfg["dict_size"]
+    act_size = cfg["act_size"]
+    if args.raw_neurons:
+        dict_size = act_size
+    else:
+        dict_size = cfg["dict_size"]
+
+    ckpt_for_fingerprint = (
+        args.sae_checkpoint
+        if args.sae_checkpoint
+        else os.path.abspath(args.sae_cfg) + "::RAW_NEURONS"
+    )
 
     # ---- Load BED concept files --------------------------------------
     bed_paths = sorted(glob.glob(os.path.join(args.bed_dir, "*.bed")))
@@ -689,7 +762,7 @@ def main():
     plan_sha = _cofa_shard_plan_sha(expected_keys)
 
     fp_expected = _cofa_fingerprint(
-        args.sae_checkpoint, bed_basenames, args.splits, args.layer, dict_size, n_concepts, plan_sha
+        ckpt_for_fingerprint, bed_basenames, args.splits, args.layer, dict_size, n_concepts, plan_sha
     )
 
     resume_json_path = os.path.join(args.out_dir, COFA_RESUME_JSON)
@@ -726,8 +799,12 @@ def main():
             need_sae = True
             break
     if need_sae:
-        print("Loading SAE ...")
-        sae = load_sae(cfg, args.sae_checkpoint, args.device)
+        if args.raw_neurons:
+            print("Raw neuron mode — skipping SAE checkpoint, using ReLU passthrough on embeddings ...")
+            sae = RawNeuronSAE(act_size).eval().to(args.device)
+        else:
+            print("Loading SAE ...")
+            sae = load_sae(cfg, args.sae_checkpoint, args.device)
     else:
         sae = None
         print("[resume] All shards already accumulated — skipping SAE load.")
