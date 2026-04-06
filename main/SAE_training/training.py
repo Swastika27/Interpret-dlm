@@ -67,8 +67,8 @@ def train_sae_wo_model(sae, activation_store, cfg):
         sae_output = sae(batch)
         loss = sae_output["loss"]
         # log_wandb(sae_output, i, wandb_run)
-        if i % cfg["perf_log_freq"]  == 0:
-            row = {"step": i, 
+        if (i+1) % cfg["perf_log_freq"]  == 0:
+            row = {"step": i+1, 
                    "total_loss": f"{loss.item()}", 
                    "l0_norm": f"{sae_output['l0_norm']}", 
                    "l2_loss": f"{sae_output['l2_loss']}", 
@@ -79,9 +79,9 @@ def train_sae_wo_model(sae, activation_store, cfg):
                 }
             write_csv_row(log_path, header, row)
 
-        if i % cfg["checkpoint_freq"] == 0:
+        if (i+1) % cfg["checkpoint_freq"] == 0:
             theta = _theta_for_checkpoint(sae, cfg)
-            save_checkpoint(sae, cfg, theta, i)
+            save_checkpoint(sae, cfg, theta, i+1)
 
         
         pbar.set_postfix({"Loss": f"{loss.item():.4f}", "L0": f"{sae_output['l0_norm']:.4f}", "L2": f"{sae_output['l2_loss']:.4f}", "L1": f"{sae_output['l1_loss']:.4f}", "L1_norm": f"{sae_output['l1_norm']:.4f}"})
