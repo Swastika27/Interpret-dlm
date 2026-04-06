@@ -112,47 +112,52 @@ for ckpt_step in "${EPOCH_CKPTS[@]}"; do
     echo "Skipping step ${ckpt_step}: checkpoint not found at $sae_ckpt"
     continue
   fi
-  result_tag="${model_basename}_step${ckpt_step}"
+  result_tag="${model_basename}/step${ckpt_step}"
   echo "========== Pipeline for checkpoint step ${ckpt_step} ($result_tag) =========="
 
-  # Evaluate on val and test split (HyenaDNA fidelity — run inside docker)
-  echo "Evaluating on val and test splits..."
-  docker exec $CONTAINER_NAME bash -c "
-    cd $docker_wdr &&
-    python main/evaluate_sae.py \
-      --sae_path trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt \
-      --cfg_path trained_models/$model_basename/config.json \
-      --val_embeddings_path $docker_wdr/test_shards/test/layer_${layer} \
-      --test_embeddings_path $docker_wdr/test_shards/test/layer_${layer} \
-      --output_file results/$result_tag/eval_metrics.yaml \
-      --device cuda \
-      --resume \
-      --val_bed_path data/preprocessed/val.test.bed \
-      --test_bed_path data/preprocessed/test.test.bed \
-      --genome_path data/raw/GRCh38.primary_assembly.genome.fa \
-      --hyenadna_checkpoint_path LongSafari/hyenadna-large-1m-seqlen-hf \
-      --fidelity_max_seq_len $seq_len \
-      --layer_idx $(($layer - 1))
-    "
+  # # Evaluate on val and test split (HyenaDNA fidelity — run inside docker)
+  # echo "Evaluating on val and test splits..."
+  # docker exec \
+  # --user $(id -u):$(id -g) \
+  # -e HF_HOME=/workspace/mnt/disk1/swastika/.cache/huggingface \
+  # -e TRANSFORMERS_CACHE=/workspace/mnt/disk1/swastika/.cache/huggingface \
+  # $CONTAINER_NAME bash -c "
+  #   cd $docker_wdr && \
+  #   python main/evaluate_sae.py \
+  #     --sae_path trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt \
+  #     --cfg_path trained_models/$model_basename/config.json \
+  #     --val_embeddings_path $docker_wdr/test_shards/test/layer_${layer} \
+  #     --test_embeddings_path $docker_wdr/test_shards/test/layer_${layer} \
+  #     --output_file results/$result_tag/eval_metrics.yaml \
+  #     --device cuda \
+  #     --resume \
+  #     --val_bed_path data/preprocessed/val.test.bed \
+  #     --test_bed_path data/preprocessed/test.test.bed \
+  #     --genome_path data/raw/GRCh38.primary_assembly.genome.fa \
+  #     --hyenadna_checkpoint_path LongSafari/hyenadna-large-1m-seqlen-hf \
+  #     --fidelity_max_seq_len $seq_len \
+  #     --layer_idx $(($layer - 1))
+  #   "
 
-  python main/find_top_activations.py \
-    --sae_checkpoint  trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt \
-    --sae_cfg         trained_models/$model_basename/config.json \
-    --embed_dir       test_shards \
-    --layer           $layer \
-    --splits          test \
-    --top_n           200 \
-    --out_dir         results/$result_tag/top_activations \
-    --device          cuda \
-    --batch_size      2048 \
-    --num_workers     4 \
-    --resume
+  # python main/find_top_activations.py \
+  #   --sae_checkpoint  trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt \
+  #   --sae_cfg         trained_models/$model_basename/config.json \
+  #   --embed_dir       test_shards \
+  #   --layer           $layer \
+  #   --splits          test \
+  #   --top_n           200 \
+  #   --out_dir         results/$result_tag/top_activations \
+  #   --device          cuda \
+  #   --batch_size      2048 \
+  #   --num_workers     4 \
+  #   --resume
 
-  python main/annotate_top_activations.py \
-    --top_activations  results/$result_tag/top_activations/top_activations.pt \
-    --bed_dir          test_annotations \
-    --out_dir          results/$result_tag/feature_annotation_assoc \
-    --resume
+  # echo               "annotating feature activations with concept overlap"
+  # python main/annotate_top_activations.py \
+  #   --top_activations  results/$result_tag/top_activations/top_activations.pt \
+  #   --bed_dir          test_annotations \
+  #   --out_dir          results/$result_tag/feature_annotation_assoc \
+  #   --resume
 
   echo "running concept -> feature analysis for $result_tag"
   python main/concept_feature_analysis.py \
@@ -162,7 +167,22 @@ for ckpt_step in "${EPOCH_CKPTS[@]}"; do
     --layer           $layer \
     --splits          test \
     --bed_dir         test_annotations/ \
-    --out_dir         results/$result_tag/concept_analysis \
+    --out_dir         results/$result_tag/feature_concept_analysis \
+    --device          cuda \
+    --batch_size      1024 \
+    --top_k_features  10 \
+    --seed            $SEED \
+    --resume
+
+  echo "feature neuron association analysis"
+  python main/concept_feature_analysis.py \
+    --raw_neurons \
+    --sae_cfg         trained_models/$model_basename/config.json \
+    --save_dir        test_shards \
+    --layer           $layer \
+    --splits          test \
+    --bed_dir         test_annotations/ \
+    --out_dir         results/$result_tag/neuron_concept_analysis \
     --device          cuda \
     --batch_size      1024 \
     --top_k_features  10 \
