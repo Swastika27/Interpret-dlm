@@ -2,7 +2,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import os
 
-log_dir = "trained_models/layer6_16384_batchtopk_32_0.0003"
+log_dir = "trained_models/layer6_8192_gated_l10.01_aux1.0_0.0003"
 
 os.makedirs(f"{log_dir}/plots", exist_ok=True)
 # Load CSV
