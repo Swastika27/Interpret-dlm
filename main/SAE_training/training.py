@@ -112,7 +112,7 @@ def train_sae_wo_model(sae, activation_store, cfg):
                     gated_state["warmup_step"] = 0
 
     theta = _theta_for_checkpoint(sae, cfg)
-    save_checkpoint(sae, cfg, theta, i)
+    save_checkpoint(sae, cfg, theta, i+1)
 
 
 def train_sae(sae, activation_store, model, cfg):
