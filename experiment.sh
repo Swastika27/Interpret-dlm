@@ -10,7 +10,7 @@ N_TRAIN=800000
 N_VAL=40000
 N_TEST=40000
 
-expansion_factor=32
+expansion_factor=64
 top_k=32
 epoch=10
 lr=0.0003
@@ -38,11 +38,11 @@ conda activate interpret
 # model_basename="layer${layer}_${dict_size}_batchtopk_${top_k}_${lr}"
 
 # Gated SAE alternative: set l1_coeff_gated / gated_aux_coeff and use model_basename_gated in eval paths below.
-l1_coeff_gated=0.01
+l1_coeff_gated=1.0
 gated_aux_coeff=1.0
 model_basename_gated="layer${layer}_${dict_size}_gated_l1${l1_coeff_gated}_aux${gated_aux_coeff}_${lr}"
 model_basename=$model_basename_gated
-# # train SAE on training embeddings (SAE_training)
+# # train SAE on training embeddings (BAtchtopk)
 # python main/SAE_training/main.py \
 #     --layer $layer \
 #     --num_tokens $num_train_tokens \
@@ -63,8 +63,12 @@ model_basename=$model_basename_gated
 #     --gated_aux_coeff $gated_aux_coeff \
 #     --perf_log_freq $perf_log_freq \
 #     --checkpoint_freq $checkpoint_freq \
+#     --name $model_basename \
 #     # --embedding_glob test_shards/*.pt
 
+
+echo "plotting training info"
+python utils/plot_training_info.py trained_models/$model_basename
 
 if [ -n "$(docker ps -f "name=^/${CONTAINER_NAME}$" -f "status=running" -q)" ]; then
     echo "The container $CONTAINER_NAME is running."
@@ -98,7 +102,7 @@ fi
 CK_STEPS=()
 for ep in $(seq 1 "$epoch"); do
   nominal=$(( ep * batches_per_epoch )) # should be -1 but I did not save that checkpoint
-  if [ "$nominal" -ge "$num_batches_total" ]; then nominal=$(( num_batches_total - 1 )); fi
+  # if [ "$nominal" -ge "$num_batches_total" ]; then nominal=$(( num_batches_total - 1 )); fi
   ck=$(( (nominal / checkpoint_freq) * checkpoint_freq ))
   CK_STEPS+=("$ck")
 done
@@ -126,8 +130,8 @@ for ckpt_step in "${EPOCH_CKPTS[@]}"; do
     python main/evaluate_sae.py \
       --sae_path trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt \
       --cfg_path trained_models/$model_basename/config.json \
-      --val_embeddings_path $docker_wdr/data/embeddings/val/layer_${layer} \
-      --test_embeddings_path $docker_wdr/data/embeddings/test/layer_${layer} \
+      --val_embeddings_path $docker_base/$disk2_embed_dir/val/layer_${layer} \
+      --test_embeddings_path $docker_base/$disk2_embed_dir/test/layer_${layer} \
       --output_file results/$result_tag/eval_metrics.yaml \
       --device cuda \
       --resume \
@@ -139,55 +143,58 @@ for ckpt_step in "${EPOCH_CKPTS[@]}"; do
       --layer_idx $(($layer - 1))
      "
 
-  python main/find_top_activations.py \
-    --sae_checkpoint  trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt \
-    --sae_cfg         trained_models/$model_basename/config.json \
-    --embed_dir       $disk2_embed_dir \
-    --layer           $layer \
-    --splits          val test \
-    --top_n           200 \
-    --out_dir         results/$result_tag/top_activations \
-    --device          cuda \
-    --batch_size      2048 \
-    --num_workers     4 \
-  #   --resume
-
-  echo "Anotating top activations with overlapping concepts" 
-  python main/annotate_top_activations.py \
-    --top_activations  results/$result_tag/top_activations/top_activations.pt \
-    --bed_dir          all_annotations \
-    --out_dir          results/$result_tag/activation_concept_assoc \
-    --resume
-
-  # echo "running concept -> feature analysis for $result_tag"
-  # python main/concept_feature_analysis.py \
+  # python main/find_top_activations.py \
   #   --sae_checkpoint  trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt \
   #   --sae_cfg         trained_models/$model_basename/config.json \
-  #   --save_dir        $disk2_embed_dir \
+  #   --embed_dir       $disk2_embed_dir \
   #   --layer           $layer \
   #   --splits          val test \
-  #   --bed_dir         all_annotations/ \
-  #   --out_dir         results/$result_tag/feature_concept_analysis \
+  #   --top_n           200 \
+  #   --out_dir         results/$result_tag/top_activations \
   #   --device          cuda \
-  #   --batch_size      1024 \
-  #   --top_k_features  10 \
-  #   --seed            $SEED \
+  #   --batch_size      2048 \
+  #   --num_workers     4 \
   #   --resume
 
-  # echo "running concept -> neuron analysis for $result_tag"
-  # python main/concept_feature_analysis.py \
-  #   --raw_neurons \
-  #   --sae_cfg         trained_models/$model_basename/config.json \
-  #   --save_dir        $disk2_embed_dir \
-  #   --layer           $layer \
-  #   --splits          val test \
-  #   --bed_dir         all_annotations/ \
-  #   --out_dir         results/$result_tag/neuron_concept_analysis \
-  #   --device          cuda \
-  #   --batch_size      1024 \
-  #   --top_k_features  10 \
-  #   --seed            $SEED \
+  # echo "Anotating top activations with overlapping concepts" 
+  # python main/annotate_top_activations.py \
+  #   --top_activations  results/$result_tag/top_activations/top_activations.pt \
+  #   --bed_dir          all_annotations \
+  #   --out_dir          results/$result_tag/activation_concept_assoc \
   #   --resume
+
+  echo "running concept -> feature analysis for $result_tag"
+  python main/concept_feature_analysis.py \
+    --sae_checkpoint  trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt \
+    --sae_cfg         trained_models/$model_basename/config.json \
+    --save_dir        $disk2_embed_dir \
+    --layer           $layer \
+    --splits          val test \
+    --bed_dir         all_annotations/ \
+    --out_dir         results/$result_tag/feature_concept_analysis \
+    --device          cuda \
+    --batch_size      1024 \
+    --top_k_features  10 \
+    --seed            $SEED \
+    --resume
+
+  echo "running concept -> neuron analysis for $result_tag"
+  python main/concept_feature_analysis.py \
+    --raw_neurons \
+    --sae_cfg         trained_models/$model_basename/config.json \
+    --save_dir        $disk2_embed_dir \
+    --layer           $layer \
+    --splits          val test \
+    --bed_dir         all_annotations/ \
+    --out_dir         results/$result_tag/neuron_concept_analysis \
+    --device          cuda \
+    --batch_size      1024 \
+    --top_k_features  10 \
+    --seed            $SEED \
+    --resume
 
 done
 
+python utils/plot_feature_neuron_concept_assoc.py \
+    --results_root results/$model_basename \
+    --out_dir results/$model_basename/concept_assoc_plots
