@@ -38,7 +38,7 @@ conda activate interpret
 # model_basename="layer${layer}_${dict_size}_batchtopk_${top_k}_${lr}"
 
 # Gated SAE alternative: set l1_coeff_gated / gated_aux_coeff and use model_basename_gated in eval paths below.
-l1_coeff_gated=1.0
+l1_coeff_gated=0.5
 gated_aux_coeff=1.0
 model_basename_gated="layer${layer}_${dict_size}_gated_l1${l1_coeff_gated}_aux${gated_aux_coeff}_${lr}"
 model_basename=$model_basename_gated
@@ -51,25 +51,32 @@ model_basename=$model_basename_gated
 #     --batch_size $batch_size \
 #     --perf_log_freq $perf_log_freq \
 #     --checkpoint_freq $checkpoint_freq \
+      # --name $model_basename
 
-# # Gated SAE training example (uncomment to run instead of SAE_training; comment out the block above):
-# python main/SAE_training/main.py \
-#     --sae_type gated \
-#     --layer $layer \
-#     --num_tokens $num_train_tokens \
-#     --dict_size $dict_size \
-#     --batch_size $batch_size \
-#     --l1_coeff $l1_coeff_gated \
-#     --gated_aux_coeff $gated_aux_coeff \
-#     --perf_log_freq $perf_log_freq \
-#     --checkpoint_freq $checkpoint_freq \
-#     --name $model_basename \
-#     # --embedding_glob test_shards/*.pt
+# Gated SAE training example (uncomment to run instead of SAE_training; comment out the block above):
+if [ -f "trained_models/$model_basename/checkpoints/step_${num_train_tokens}" ]; then
+echo "Final checkpoint already exists. Skipping training..."
+else
+python main/SAE_training/main.py \
+    --sae_type gated \
+    --layer $layer \
+    --num_tokens $num_train_tokens \
+    --dict_size $dict_size \
+    --batch_size $batch_size \
+    --l1_coeff $l1_coeff_gated \
+    --gated_aux_coeff $gated_aux_coeff \
+    --perf_log_freq $perf_log_freq \
+    --checkpoint_freq $checkpoint_freq \
+    --name $model_basename \
+    # --embedding_glob test_shards/*.pt
+  fi
 
 
+# Plot training metrics
 echo "plotting training info"
 python utils/plot_training_info.py trained_models/$model_basename
 
+# Start running docker container forrrrrr evaluation
 if [ -n "$(docker ps -f "name=^/${CONTAINER_NAME}$" -f "status=running" -q)" ]; then
     echo "The container $CONTAINER_NAME is running."
 else
