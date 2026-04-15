@@ -106,8 +106,7 @@ for ep in $(seq 1 "$epoch"); do
   ck=$(( (nominal / checkpoint_freq) * checkpoint_freq ))
   CK_STEPS+=("$ck")
 done
-last_step=$(( num_batches_total - 1 ))
-CK_STEPS+=("$last_step")
+
 readarray -t EPOCH_CKPTS < <(printf '%s\n' "${CK_STEPS[@]}" | sort -nu)
 
 for ckpt_step in "${EPOCH_CKPTS[@]}"; do
