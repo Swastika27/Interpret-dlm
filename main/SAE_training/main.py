@@ -58,6 +58,8 @@ def parse_args():
                         help="Performance logging frequency (steps)")
     parser.add_argument("--checkpoint_freq", type=int, default=10000,
                         help="Checkpoint saving frequency (steps)")
+    parser.add_argument("--name", type=str, default=None,
+                        help="Model name. Checkpoints and logs will be saved in trained_models/<name> directory")
 
     return parser.parse_args()
 
@@ -103,6 +105,7 @@ def main():
     cfg["bandwidth"]       = args.bandwidth
     cfg["perf_log_freq"]   = args.perf_log_freq
     cfg["checkpoint_freq"] = args.checkpoint_freq
+    cfg["name"]            = args.name
 
     SAE_CLASSES = {
         "vanilla":   VanillaSAE,

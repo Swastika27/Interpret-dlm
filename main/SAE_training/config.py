@@ -67,15 +67,16 @@ def post_init_cfg(cfg):
     if st == "gated" and cfg.get("gated_use_paper_optimizer", True):
         cfg["beta1"] = 0.0
         cfg["beta2"] = 0.999
-    if st == "gated":
-        cfg["name"] = (
-            f"layer{cfg['layer']}_{cfg['dict_size']}_{cfg['sae_type']}_"
-            f"l1{cfg['l1_coeff']}_aux{cfg.get('gated_aux_coeff', 1.0)}_{cfg['lr']}"
-        )
-    else:
-        cfg["name"] = (
-            f"layer{cfg['layer']}_{cfg['dict_size']}_{cfg['sae_type']}_"
-            f"{cfg['top_k']}_{cfg['lr']}"
-        )
+    if not cfg["name"]:
+        if st == "gated":
+            cfg["name"] = (
+                f"layer{cfg['layer']}_{cfg['dict_size']}_{cfg['sae_type']}_"
+                f"l1{cfg['l1_coeff']}_aux{cfg.get('gated_aux_coeff', 1.0)}_{cfg['lr']}"
+            )
+        else:
+            cfg["name"] = (
+                f"layer{cfg['layer']}_{cfg['dict_size']}_{cfg['sae_type']}_"
+                f"{cfg['top_k']}_{cfg['lr']}"
+            )
     cfg["run_dir"] = f"trained_models/{cfg['name']}"
     return cfg
