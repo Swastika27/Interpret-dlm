@@ -120,6 +120,9 @@ for ckpt_step in "${EPOCH_CKPTS[@]}"; do
 
   # Evaluate on val and test split (HyenaDNA fidelity — run inside docker)
   echo "Evaluating on val and test splits..."
+  if [ -f "results/$result_tag/eval_metrics.yaml" ]; then
+    echo "Output file already exists. Skipping..."
+  else
   docker exec \
   --user $(id -u):$(id -g) \
   -e HF_HOME=/workspace/mnt/disk1/swastika/.cache/huggingface \
@@ -139,9 +142,10 @@ for ckpt_step in "${EPOCH_CKPTS[@]}"; do
       --genome_path data/raw/GRCh38.primary_assembly.genome.fa \
       --hyenadna_checkpoint_path LongSafari/hyenadna-large-1m-seqlen-hf \
       --fidelity_max_seq_len $seq_len \
-      --layer_idx $(($layer - 1))
+      --layer_idx $(($layer - 1)) \
+      --resume
      "
-
+  fi
   # python main/find_top_activations.py \
   #   --sae_checkpoint  trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt \
   #   --sae_cfg         trained_models/$model_basename/config.json \
@@ -163,6 +167,9 @@ for ckpt_step in "${EPOCH_CKPTS[@]}"; do
   #   --resume
 
   echo "running concept -> feature analysis for $result_tag"
+  if [ -f "results/$result_tag/feature_concept_analysis/summary.csv" ]; then
+  echo "output file already exists. Skipping..."
+  else
   python main/concept_feature_analysis.py \
     --sae_checkpoint  trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt \
     --sae_cfg         trained_models/$model_basename/config.json \
@@ -176,8 +183,12 @@ for ckpt_step in "${EPOCH_CKPTS[@]}"; do
     --top_k_features  10 \
     --seed            $SEED \
     --resume
+  fi
 
   echo "running concept -> neuron analysis for $result_tag"
+  if [ -f "results/$result_tag/neuron_concept_analysis/summary.csv" ]; then
+  echo "Output file already exists. Skipping..."
+  else
   python main/concept_feature_analysis.py \
     --raw_neurons \
     --sae_cfg         trained_models/$model_basename/config.json \
@@ -191,7 +202,7 @@ for ckpt_step in "${EPOCH_CKPTS[@]}"; do
     --top_k_features  10 \
     --seed            $SEED \
     --resume
-
+  fi
 done
 
 python utils/plot_feature_neuron_concept_assoc.py \

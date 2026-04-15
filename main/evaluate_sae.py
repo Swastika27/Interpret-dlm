@@ -899,7 +899,7 @@ def evaluate_sae(
     layer_idx: Optional[int] = None,
     fidelity_batch_size: int = 4,
     fidelity_max_seq_len: int = 1024,
-    resume: bool = False,
+    resume: bool = True,
 ):
     """
     Evaluate SAE on pre-saved val and test embeddings stored as sharded .pt files.
