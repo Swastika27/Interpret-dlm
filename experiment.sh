@@ -153,6 +153,65 @@ for ckpt_step in "${EPOCH_CKPTS[@]}"; do
       --resume
      "
   fi
+
+  # Dense-feature diagnostics (exclude dense features, correlate with token stats, worst-MSE dims)
+  # Read dense_top_n from eval_metrics.yaml (uses sparsity.highly_active_features, which is what you observed as "8").
+  eval_yaml="results/$result_tag/eval_metrics.yaml"
+  dense_top_n=$(
+    python - <<'PY'
+import sys
+from pathlib import Path
+try:
+    import yaml
+except Exception as e:
+    raise SystemExit("Missing PyYAML. Install into this environment: pip install pyyaml") from e
+
+path = Path(sys.argv[1])
+if not path.is_file():
+    print("8")  # safe fallback
+    raise SystemExit(0)
+
+data = yaml.safe_load(path.read_text(encoding="utf-8"))
+def get_int(d, keys, default=None):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    try:
+        return int(cur)
+    except Exception:
+        return default
+
+v = get_int(data, ["val", "sparsity", "highly_active_features"])
+t = get_int(data, ["test", "sparsity", "highly_active_features"])
+
+# Prefer a conservative choice (max across splits), fall back to 8 if missing.
+vals = [x for x in [v, t] if x is not None]
+print(max(vals) if vals else 8)
+PY
+    "$eval_yaml"
+  )
+  echo "Running dense-feature epoch diagnostics (dense_top_n=$dense_top_n) for $result_tag"
+  if [ -f "results/$result_tag/epoch_diagnostics/epoch_summary.csv" ]; then
+    echo "Diagnostics already exist. Skipping..."
+  else
+    python main/sae_epoch_diagnostics.py \
+      --sae_cfg trained_models/$model_basename/config.json \
+      --checkpoints_glob trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt \
+      --save_dir $disk2_embed_dir \
+      --layer $layer \
+      --splits val test \
+      --bed_dir all_annotations/ \
+      --out_dir results/$result_tag/epoch_diagnostics \
+      --device cuda \
+      --eval_batch_size 1024 \
+      --dense_top_n "$dense_top_n" \
+      --dense_freq_threshold 0.10 \
+      --assoc_f1_threshold 0.10 \
+      --high_mse_top_k 20
+  fi
+
   # python main/find_top_activations.py \
   #   --sae_checkpoint  trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt \
   #   --sae_cfg         trained_models/$model_basename/config.json \
