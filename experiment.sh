@@ -157,8 +157,12 @@ for ckpt_step in "${EPOCH_CKPTS[@]}"; do
   # Dense-feature diagnostics (exclude dense features, correlate with token stats, worst-MSE dims)
   # Read dense_top_n from eval_metrics.yaml (uses sparsity.highly_active_features, which is what you observed as "8").
   eval_yaml="results/$result_tag/eval_metrics.yaml"
+  # #region agent log
+  printf '{"sessionId":"ff640b","runId":"pre-fix","hypothesisId":"H0","location":"experiment.sh:eval_yaml","message":"Dense-top-N parse starting","data":{"eval_yaml":"%s","ckpt_step":"%s"},"timestamp":%s}\n' \
+    "$eval_yaml" "$ckpt_step" "$(date +%s%3N)" >> debug-ff640b.log
+  # #endregion
   dense_top_n=$(
-    python - <<'PY'
+    python - "$eval_yaml" <<'PY'
 import sys
 from pathlib import Path
 try:
@@ -190,8 +194,11 @@ t = get_int(data, ["test", "sparsity", "highly_active_features"])
 vals = [x for x in [v, t] if x is not None]
 print(max(vals) if vals else 8)
 PY
-    "$eval_yaml"
   )
+  # #region agent log
+  printf '{"sessionId":"ff640b","runId":"pre-fix","hypothesisId":"H1","location":"experiment.sh:dense_top_n","message":"Dense-top-N parsed","data":{"dense_top_n":"%s"},"timestamp":%s}\n' \
+    "$dense_top_n" "$(date +%s%3N)" >> debug-ff640b.log
+  # #endregion
   echo "Running dense-feature epoch diagnostics (dense_top_n=$dense_top_n) for $result_tag"
   if [ -f "results/$result_tag/epoch_diagnostics/epoch_summary.csv" ]; then
     echo "Diagnostics already exist. Skipping..."
