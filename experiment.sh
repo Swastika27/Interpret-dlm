@@ -54,9 +54,11 @@ model_basename=$model_basename_gated
       # --name $model_basename
 
 # Gated SAE training example (uncomment to run instead of SAE_training; comment out the block above):
-if [ -f "trained_models/$model_basename/checkpoints/step_${num_train_tokens}" ]; then
+final_checkpoint_file="trained_models/$model_basename/checkpoints/step_${num_batches_total}.pt"
+if [ -f $final_checkpoint_file ]; then
 echo "Final checkpoint already exists. Skipping training..."
 else
+echo "Did not find        $final_checkpoint_file , trainingggggggg..."
 python main/SAE_training/main.py \
     --sae_type gated \
     --layer $layer \
