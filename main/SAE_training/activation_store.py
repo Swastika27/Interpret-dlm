@@ -1,13 +1,55 @@
 import glob
+import json
+import os
 import random
+import time
 from typing import Any, Dict
 
 import torch
+
+_DBG_LOG_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "debug-2bbb4e.log")
+)
+
+
+def _agent_dbg_log(hypothesis_id: str, location: str, message: str, data: dict) -> None:
+    # region agent log
+    try:
+        with open(_DBG_LOG_PATH, "a", encoding="utf-8") as _f:
+            _f.write(
+                json.dumps(
+                    {
+                        "sessionId": "2bbb4e",
+                        "timestamp": int(time.time() * 1000),
+                        "hypothesisId": hypothesis_id,
+                        "location": location,
+                        "message": message,
+                        "data": data,
+                        "runId": "pre-fix",
+                    }
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+    # endregion
 
 class StreamingActivationsStore:
     def __init__(self, cfg):
         self.cfg = cfg
         self.device = cfg["device"]
+        # region agent log
+        _agent_dbg_log(
+            "H1",
+            "activation_store.py:StreamingActivationsStore.__init__",
+            "cfg device type and value at store init",
+            {
+                "device_repr": repr(cfg.get("device")),
+                "device_type_name": type(cfg.get("device")).__name__,
+                "has_type_attr": hasattr(cfg.get("device"), "type"),
+            },
+        )
+        # endregion
 
         # Find all shard files
         self.shard_paths = sorted(glob.glob(cfg["embedding_glob"]))
@@ -57,6 +99,17 @@ class StreamingActivationsStore:
         self.current_pos = 0
 
     def _load_shard(self, shard_path):
+        # region agent log
+        _agent_dbg_log(
+            "H2",
+            "activation_store.py:_load_shard",
+            "self.device before .type access",
+            {
+                "self_device_type_name": type(self.device).__name__,
+                "self_device_repr": repr(self.device),
+            },
+        )
+        # endregion
         shard_dict = torch.load(shard_path, map_location="cpu")
         x = shard_dict['emb'].reshape(-1, self.act_size)  # flatten (B, L, D) -> (B*L, D)
         # optional: shuffle tokens **within shard** to increase randomness
