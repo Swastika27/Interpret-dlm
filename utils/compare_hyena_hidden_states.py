@@ -11,8 +11,8 @@ Compare HyenaDNA hidden representations for sanity checks:
 
 Usage (from repo root):
 
-    python utils/compare_hyena_hidden_states.py \\
-        --model_id LongSafari/hyenadna-large-1m-seqlen-hf \\
+    python utils/compare_hyena_hidden_states.py \
+        --model_id LongSafari/hyenadna-large-1m-seqlen-hf \
         --seq_len 512
 
 Requires: transformers, torch
