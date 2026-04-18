@@ -34,13 +34,18 @@ top_activations.pt keys:
     act_values   FloatTensor [n_features, top_n]
     token_pos    LongTensor  [n_features, top_n]   position within the model window (0..L-1)
     coords       list[list[tuple]]                 [n_features][top_n] → (chrom,start,end) full window BED
+    seq_idx      list[list[int]]                   [n_features][top_n] → sequence row index within shard
+    seq_len      int or None                       tokens per sequence (L); for annotate 1 bp intervals
     context_seqs list[list[str]]                   [n_features][top_n] → same window as "chrom:start-end" (llm_sae_interpreter CSV column)
     split        list[list[str]]                   [n_features][top_n] → split folder name (e.g. train/test)
     shard_path   list[list[str]]                   [n_features][top_n] → source shard file
     cfg          dict
 
-Coordinates match the embedding BED window (e.g. 512 bp); tok_pos indexes the activating base within
-that window — compatible with llm_sae_interpreter/steps/step1_fetch_sequences.py and step2_normalize.py.
+Per feature, at most one top entry per (shard, sequence row): duplicate windows are merged by keeping
+the highest activation (annotate uses token_pos for 1 bp genomic intervals).
+
+Coordinates match the embedding BED window (e.g. 512 bp); tok_pos indexes the activating token within
+that window — use with seq_len for single-base positions (annotate_top_activations, concept_feature_analysis).
 
 Gated SAE: use the same checkpoint and config.json from training with "sae_type": "gated"
 (BatchTopK/main.py saves config next to checkpoints).
@@ -53,7 +58,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Callable, List, Set, Tuple, Optional
+from typing import Callable, List, Set, Tuple, Optional, Dict
 
 import torch
 import torch.nn.functional as F
@@ -61,7 +66,17 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 import sys
+
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 sys.path.insert(0, os.path.dirname(__file__))
+from utils.gpu_setup import (  # noqa: E402
+    configure_cuda_performance,
+    resolve_device_str,
+    tensor_to_device_fast,
+)
 from concept_feature_analysis import get_activations  # type: ignore
 from SAE_training.sae import (
     BatchTopKSAE,
@@ -280,7 +295,7 @@ def process_shards(
         # accumulator, so the full-shard activation matrix is never materialised.
         for start in range(0, B * L, batch_size):
             end      = min(start + batch_size, B * L)
-            chunk    = emb_flat[start:end].to(device)
+            chunk    = tensor_to_device_fast(emb_flat[start:end], device)
             acts     = get_activations(sae, chunk, return_cpu=False)
 
             k        = min(accumulator.top_n, acts.shape[0])
@@ -323,6 +338,9 @@ def save_results(
     context_out = []
     split_out   = []
     shard_out   = []
+    seq_idx_out: List[List[int]] = []
+
+    seq_len_ref: Optional[int] = int(shard_registry[0]["L"]) if shard_registry else None
 
     for fi in range(n_features):
         coords_row  = []
@@ -330,31 +348,53 @@ def save_results(
         split_row   = []
         shard_row   = []
 
+        # Candidates from raw accumulator (may include duplicate windows)
+        cand: List[Tuple[float, int, int]] = []  # (val, shard_id, flat_idx)
         for rank in range(top_n):
-            val      = vals_np[fi, rank].item()
-            flat_idx = tok_np[fi, rank].item()
-            sh_id    = shard_np[fi, rank].item()
-
+            val = vals_np[fi, rank].item()
+            flat_idx = int(tok_np[fi, rank].item())
+            sh_id = int(shard_np[fi, rank].item())
             if val == -float("inf") or sh_id >= len(shard_registry):
-                # Unfilled slot
+                continue
+            cand.append((val, sh_id, flat_idx))
+
+        # One entry per (shard, sequence row): keep max activation
+        best: Dict[Tuple[int, int], Tuple[float, int, int]] = {}
+        for val, sh_id, flat_idx in cand:
+            reg = shard_registry[sh_id]
+            L = int(reg["L"])
+            seq_idx = int(flat_idx // L)
+            key = (sh_id, seq_idx)
+            prev = best.get(key)
+            if prev is None or val > prev[0]:
+                best[key] = (val, flat_idx, sh_id)
+
+        merged = sorted(best.values(), key=lambda x: -x[0])[:top_n]
+
+        seq_idx_row: List[int] = []
+
+        for rank in range(top_n):
+            if rank >= len(merged):
                 coords_row.append(None)
                 context_row.append("")
                 split_row.append("")
                 shard_row.append("")
+                seq_idx_row.append(-1)
                 continue
 
-            reg  = shard_registry[sh_id]
-            L    = reg["L"]
-            seq_idx = flat_idx // L
-            tok_pos = flat_idx  % L
+            val, flat_idx, sh_id = merged[rank]
+            reg = shard_registry[sh_id]
+            L = int(reg["L"])
+            seq_idx = int(flat_idx // L)
+            tok_pos = flat_idx % L
+            seq_idx_row.append(seq_idx)
 
-            act_values[fi, rank]  = val
-            token_pos_t[fi, rank] = tok_pos
+            act_values[fi, rank] = val
+            token_pos_t[fi, rank] = int(tok_pos)
 
             coords_list = reg["coords_list"]
-            seq_coord   = coords_list[seq_idx]
+            seq_coord = coords_list[seq_idx]
 
-            # Full-window BED only (same as embedding shard); tok_pos is index within window.
             window_bed = _window_bed_from_seq_coord(seq_coord, L)
             coord = window_bed
             context = _window_context_str(window_bed)
@@ -368,6 +408,7 @@ def save_results(
         context_out.append(context_row)
         split_out.append(split_row)
         shard_out.append(shard_row)
+        seq_idx_out.append(seq_idx_row)
 
     save_dict = {
         "act_values":   act_values,
@@ -376,6 +417,8 @@ def save_results(
         "context_seqs": context_out,
         "split":        split_out,
         "shard_path":   shard_out,
+        "seq_idx":      seq_idx_out,
+        "seq_len":      seq_len_ref,
         "cfg": {
             "top_n":       top_n,
             "layer":       layer,
@@ -385,9 +428,9 @@ def save_results(
 
     pt_path = os.path.join(out_dir, "top_activations.pt")
     torch.save(save_dict, pt_path)
-    print(f"Saved {pt_path}")
+    print(f"Saved {pt_path} (deduplicated top activations per sequence window per feature)")
 
-    # CSV — only iterate the (small) nonzero set  (optimization #5)
+    # CSV — filled slots (any finite activation saved above)
     csv_path = os.path.join(out_dir, "top_activations.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
@@ -397,27 +440,25 @@ def save_results(
             "coord_chrom", "coord_start", "coord_end",
             "context_window",
         ])
-        # Only visit filled slots
-        filled = (act_values > 0).nonzero(as_tuple=False)  # (M, 2)
-        for fi, rank in filled.tolist():
-            val   = act_values[fi, rank].item()
-            tp    = token_pos_t[fi, rank].item()
-            coord = coords_out[fi][rank]
-            chrom, cs, ce = (coord if coord and len(coord) == 3 else ("", "", ""))
-            ctx_str = context_out[fi][rank] if isinstance(context_out[fi][rank], str) else ""
-            sh_id   = shard_np[fi, rank].item()
-            reg     = shard_registry[sh_id] if sh_id < len(shard_registry) else {}
-            flat_idx = tok_np[fi, rank].item()
-            L       = reg.get("L", 1)
-            seq_idx = flat_idx // L
+        for fi in range(n_features):
+            for rank in range(top_n):
+                if coords_out[fi][rank] is None:
+                    continue
+                val = act_values[fi, rank].item()
+                tp = int(token_pos_t[fi, rank].item())
+                coord = coords_out[fi][rank]
+                chrom, cs, ce = (coord if coord and len(coord) == 3 else ("", "", ""))
+                ctx_str = context_out[fi][rank] if isinstance(context_out[fi][rank], str) else ""
+                sp = shard_out[fi][rank]
+                seq_idx = seq_idx_out[fi][rank]
 
-            writer.writerow([
-                fi, rank, f"{val:.6f}",
-                split_out[fi][rank], shard_out[fi][rank],
-                seq_idx, tp,
-                chrom, cs, ce,
-                ctx_str,
-            ])
+                writer.writerow([
+                    fi, rank, f"{val:.6f}",
+                    split_out[fi][rank], sp,
+                    seq_idx, tp,
+                    chrom, cs, ce,
+                    ctx_str,
+                ])
     print(f"Saved {csv_path}")
 
 
@@ -434,7 +475,11 @@ def parse_args():
     p.add_argument("--splits",         nargs="+", default=["train", "test"])
     p.add_argument("--top_n",          type=int, default=10,   help="Top-N tokens per feature")
     p.add_argument("--out_dir",        required=True,          help="Where to write results")
-    p.add_argument("--device",         default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument(
+        "--device",
+        default=None,
+        help="cuda (default if available), cpu, … — falls back to CPU if CUDA unavailable.",
+    )
     p.add_argument("--batch_size",     type=int, default=4096, help="Sub-batch size for SAE forward pass")
     p.add_argument("--num_workers",    type=int, default=4,    help="DataLoader worker processes")
     p.add_argument(
@@ -520,6 +565,8 @@ def _ft_clear_resume(out_dir: str) -> None:
 
 def main():
     args = parse_args()
+    args.device = resolve_device_str(args.device)
+    configure_cuda_performance()
 
     with open(args.sae_cfg) as f:
         cfg = json.load(f)

@@ -2,11 +2,15 @@
 annotate_top_activations.py  (optimized)
 
 Instead of one BEDTools call per (feature, concept) pair, we do:
-  1. Build one BED file containing ALL top-activating tokens, labelled by feature_idx
+  1. Build one BED file containing ALL top-activating *tokens* (1 bp intervals),
+     labelled by feature_idx — uses token_pos + window coords from top_activations.pt
   2. For each concept BED, run ONE intersect against the full token BED
   3. Parse the result and groupby feature_idx to get per-feature counts
 
 This reduces BEDTools subprocess calls from O(n_features * n_concepts) → O(n_concepts).
+
+Chromosome naming matches concept_feature_analysis / embedding shards via
+utils.genomics_coords (same ``use_chr`` convention inferred from activation coords).
 """
 
 import argparse
@@ -14,64 +18,65 @@ import csv
 import itertools
 import os
 import re
+import sys
 from pathlib import Path
+from typing import List, Optional
 
 import numpy as np
 import torch
 import pybedtools
 
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
-# ---------------------------------------------------------------------------
-# Load
-# ---------------------------------------------------------------------------
-
-def load_top_activations(pt_path: str):
-    data = torch.load(pt_path, map_location="cpu")
-    return data["coords"], data["act_values"]
+from utils.genomics_coords import (  # noqa: E402
+    infer_use_chr_from_top_activation_coords,
+    token_one_bp_bed,
+)
 
 
-def normalise_chrom_convention(bed: pybedtools.BedTool) -> pybedtools.BedTool:
-    """
-    Detect whether the majority of intervals use 'chr' prefix and
-    normalise all intervals to match, then re-sort.
-    """
+def normalise_to(bed: pybedtools.BedTool, use_chr: bool) -> pybedtools.BedTool:
+    """Normalize concept BED chrom names to match embedding / token BED convention."""
     intervals = list(bed)
     if not intervals:
         return bed
-
-    n_chr    = sum(1 for i in intervals if i.chrom.startswith("chr"))
-    n_nochr  = len(intervals) - n_chr
-    use_chr  = n_chr >= n_nochr   # majority convention wins
-
     lines = []
     for i in intervals:
         chrom = i.chrom
         if use_chr and not chrom.startswith("chr"):
             chrom = "chr" + chrom
         elif not use_chr and chrom.startswith("chr"):
-            chrom = chrom[len("chr"):]
-        # Rebuild the line preserving all other fields
-        fields = [chrom] + list(i.fields[1:])
-        lines.append("\t".join(fields))
-
+            chrom = chrom[len("chr") :]
+        lines.append("\t".join([chrom] + list(i.fields[1:])))
     return pybedtools.BedTool("\n".join(lines) + "\n", from_string=True).sort()
 
-def build_all_tokens_bed(coords: list) -> pybedtools.BedTool:
-    """
-    Build a single BED with ALL tokens from ALL features.
-    Name field encodes feature_idx so we can groupby after intersect.
 
-    chrom  start  end  feature_idx
+def build_all_tokens_bed(
+    coords: list,
+    token_pos: torch.Tensor,
+    act_values: torch.Tensor,
+    use_chr: bool,
+    seq_len: Optional[int],
+) -> pybedtools.BedTool:
     """
-    lines = []
-    for fi, coord_list in enumerate(coords):
-        for coord in coord_list:
+    One 1 bp half-open interval per top activation (same genomic point as
+    concept_feature_analysis token labelling).
+    """
+    lines: List[str] = []
+    n_features = len(coords)
+    for fi in range(n_features):
+        row_coords = coords[fi]
+        for rank, coord in enumerate(row_coords):
             if coord is None:
                 continue
-            chrom, start, end = coord
+            chrom, start, end = coord[0], int(coord[1]), int(coord[2])
             if chrom == "":
                 continue
-            lines.append(f"{chrom}\t{start}\t{end}\t{fi}")
+            L = int(seq_len) if seq_len is not None else max(1, end - start)
+            tp = int(token_pos[fi, rank].item())
+            c, s, e = token_one_bp_bed(chrom, start, end, L, tp, use_chr)
+            lines.append(f"{c}\t{s}\t{e}\t{fi}")
 
     if not lines:
         return pybedtools.BedTool("", from_string=True)
@@ -122,61 +127,6 @@ def count_neither_per_feature(
         fi = int(interval.name)
         neither[fi] += 1
     return neither
-
-
-def count_pairwise_per_feature(
-    all_tokens_bed: pybedtools.BedTool,
-    concept_beds: dict[str, pybedtools.BedTool],
-    n_features: int,
-) -> dict[tuple, dict[str, list[int]]]:
-    """
-    For each pair (A, B), compute all four Venn cells independently:
-        in_A_only  : overlaps A, does NOT overlap B   → intersect A, then -v B
-        in_B_only  : overlaps B, does NOT overlap A   → intersect B, then -v A
-        in_both    : overlaps A AND B                 → intersect A, then -u B
-        in_neither : computed separately in count_neither_per_feature
-
-    Returns {(nameA, nameB): {"A_only": [...], "B_only": [...], "both": [...]}}
-    Each list is indexed by feature_idx.
-    """
-    names  = list(concept_beds)
-    result = {}
-
-    for a, b in itertools.combinations(names, 2):
-        a_only  = [0] * n_features
-        b_only  = [0] * n_features
-        both    = [0] * n_features
-
-        if len(all_tokens_bed) == 0:
-            result[(a, b)] = {"A_only": a_only, "B_only": b_only, "both": both}
-            continue
-
-        bed_a = concept_beds[a]
-        bed_b = concept_beds[b]
-
-        # Tokens in both A and B
-        in_a      = all_tokens_bed.intersect(bed_a, u=True)
-        if len(in_a) > 0:
-            in_ab = in_a.intersect(bed_b, u=True)
-            for interval in in_ab:
-                both[int(interval.name)] += 1
-
-        # Tokens in A but NOT B
-        if len(in_a) > 0:
-            in_a_not_b = in_a.intersect(bed_b, v=True)
-            for interval in in_a_not_b:
-                a_only[int(interval.name)] += 1
-
-        # Tokens in B but NOT A
-        in_b = all_tokens_bed.intersect(bed_b, u=True)
-        if len(in_b) > 0:
-            in_b_not_a = in_b.intersect(bed_a, v=True)
-            for interval in in_b_not_a:
-                b_only[int(interval.name)] += 1
-
-        result[(a, b)] = {"A_only": a_only, "B_only": b_only, "both": both}
-
-    return result
 
 
 def pairwise_cells_one_pair(
@@ -252,7 +202,7 @@ def write_venn(
     n_features: int,
     n_totals: list[int],
     per_concept_hits: dict[str, list[int]],
-    pairwise_hits: dict[tuple, list[int]],
+    pairwise_hits: dict,
     neither: list[int],
     pairs: list[tuple],
 ):
@@ -340,55 +290,48 @@ def main():
         return
 
     print(f"Loading {args.top_activations} ...")
-    coords, act_values = load_top_activations(args.top_activations)
+    data = torch.load(args.top_activations, map_location="cpu")
+    coords = data["coords"]
+    act_values = data["act_values"]
+    token_pos = data.get("token_pos")
+    seq_len = data.get("seq_len")
+    if token_pos is None:
+        raise ValueError(
+            "top_activations.pt must contain 'token_pos' (re-run find_top_activations.py). "
+            "Annotation uses per-token 1 bp intervals aligned with concept_feature_analysis."
+        )
     n_features = len(coords)
 
-    # Per-feature total valid token counts
+    use_chr = infer_use_chr_from_top_activation_coords(coords)
+    print(f"  Chromosome naming (match embeddings): use_chr={use_chr}")
+
+    # Per-feature total valid token counts (non-empty window slots)
     n_totals = [
-        sum(1 for c in coord_list if c is not None and c != ("", "", ""))
+        sum(
+            1
+            for c in coord_list
+            if c is not None and c != ("", "", "")
+        )
         for coord_list in coords
     ]
 
-    # Load concept BEDs
+    # Load concept BEDs (normalized to same chr style as token intervals)
     bed_paths = sorted(Path(args.bed_dir).glob("*.bed"))
     if not bed_paths:
         raise FileNotFoundError(f"No .bed files in {args.bed_dir}")
     print(f"Found {len(bed_paths)} concept BED files")
     concept_beds: dict[str, pybedtools.BedTool] = {
-        bp.stem: pybedtools.BedTool(str(bp)).sort()
+        bp.stem: normalise_to(pybedtools.BedTool(str(bp)).sort(), use_chr)
         for bp in bed_paths
     }
     concept_names = list(concept_beds)
     pairs = list(itertools.combinations(concept_names, 2))
 
     # Build the single combined token BED  (done once)
-    print("Building combined token BED ...")
-    all_tokens_bed = build_all_tokens_bed(coords)
+    print("Building combined token BED (1 bp per top activation) ...")
+    all_tokens_bed = build_all_tokens_bed(coords, token_pos, act_values, use_chr, seq_len)
     print(f"  {len(all_tokens_bed)} total token intervals across {n_features} features")
 
-    # Detect convention from token bed (your data is the reference)
-    sample = next(iter(all_tokens_bed))
-    tokens_use_chr = sample.chrom.startswith("chr")
-
-    def normalise_to(bed: pybedtools.BedTool, use_chr: bool) -> pybedtools.BedTool:
-        intervals = list(bed)
-        if not intervals:
-            return bed
-        lines = []
-        for i in intervals:
-            chrom = i.chrom
-            if use_chr and not chrom.startswith("chr"):
-                chrom = "chr" + chrom
-            elif not use_chr and chrom.startswith("chr"):
-                chrom = chrom[len("chr"):]
-            lines.append("\t".join([chrom] + list(i.fields[1:])))
-        return pybedtools.BedTool("\n".join(lines) + "\n", from_string=True).sort()
-
-    # Apply when loading concept BEDs
-    concept_beds: dict[str, pybedtools.BedTool] = {
-        bp.stem: normalise_to(pybedtools.BedTool(str(bp)).sort(), tokens_use_chr)
-        for bp in bed_paths
-    }
     if args.resume:
         os.makedirs(cache_dir, exist_ok=True)
         os.chmod(cache_dir, 0o777)

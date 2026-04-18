@@ -50,10 +50,21 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, List, Set, Tuple
+
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from utils.gpu_setup import (  # noqa: E402
+    configure_cuda_performance,
+    resolve_device_str,
+    tensor_to_device_fast,
+)
 
 try:
     from pyfaidx import Fasta
@@ -191,6 +202,7 @@ def iter_shard_batches(
     if not shard_paths:
         raise FileNotFoundError("No shard files provided.")
 
+    dev = torch.device(device)
     buffer: Optional[torch.Tensor] = None   # leftover rows from previous shard
 
     for shard_path in shard_paths:
@@ -227,7 +239,7 @@ def iter_shard_batches(
         # Yield full batches; keep the tail for the next shard
         start = 0
         while start + batch_size <= emb.shape[0]:
-            yield emb[start : start + batch_size].to(device)
+            yield tensor_to_device_fast(emb[start : start + batch_size], dev)
             start += batch_size
 
         if start < emb.shape[0]:
@@ -235,7 +247,7 @@ def iter_shard_batches(
 
     # Yield the final partial batch (if any)
     if buffer is not None and buffer.shape[0] > 0:
-        yield buffer.to(device)
+        yield tensor_to_device_fast(buffer, dev)
 
 
 def _eval_resume_dir(output_file: Path) -> Path:
@@ -794,7 +806,7 @@ class HyenaDNAFidelityEvaluator:
         genome: Fasta,
         layer_idx: int,
         batch_size: int = 4,
-        max_seq_len: int = 1024,
+        max_seq_len: int = 512,
         device: str = "cpu",
     ):
         self.device = device
@@ -808,13 +820,14 @@ class HyenaDNAFidelityEvaluator:
         rows = read_bed(bed_path, max_seq_len)
         seqs = fetch_batch(genome, rows)
 
-        # Load and tokenize sequences
-        
+        # Load and tokenize sequences (match extract_hyena_embeddings: one token per base)
         self.tokenized = []
         for seq in seqs:
             if len(seq) > max_seq_len:
                 seq = seq[:max_seq_len]
-            enc = self.tokenizer(seq, return_tensors="pt")
+            enc = self.tokenizer(
+                seq, return_tensors="pt", add_special_tokens=False,
+            )
             self.tokenized.append(enc["input_ids"])  # [1, seq_len]
 
         # Pre-compute original and zero-ablation baselines
@@ -902,7 +915,7 @@ def evaluate_sae(
     cfg_path: str,
     test_embeddings_path: Path,
     output_file: Optional[Path] = None,
-    device_str: str = "cuda",
+    device_str: Optional[str] = None,
     eval_batch_size: int = 4096,
     val_embeddings_path: Optional[Path] = None,
     train_embeddings_path: Optional[Path] = None,
@@ -914,7 +927,7 @@ def evaluate_sae(
     hyenadna_checkpoint_path: Optional[str] = None,
     layer_idx: Optional[int] = None,
     fidelity_batch_size: int = 4,
-    fidelity_max_seq_len: int = 1024,
+    fidelity_max_seq_len: int = 512,
     resume: bool = True,
 ):
     """
@@ -943,6 +956,8 @@ def evaluate_sae(
         resume: Skip embedding shards (and cached fidelity) already processed;
                 requires --output_file. State lives beside the YAML output.
     """
+    device_str = resolve_device_str(device_str)
+    configure_cuda_performance()
 
     # Fidelity runs per split when global deps are set and that split has a BED path.
     run_fidelity = all([
@@ -1192,7 +1207,13 @@ def parse_args():
 
     # Optional args
     parser.add_argument("--output_file", type=Path, default=None)
-    parser.add_argument("--device_str", type=str, default="cuda")
+    parser.add_argument(
+        "--device_str",
+        type=str,
+        default=None,
+        help="cuda (default if available), cpu, cuda:0, … "
+             "(falls back to CPU if CUDA unavailable).",
+    )
     parser.add_argument(
         "--eval_batch_size", type=int, default=4096,
         help="Tokens per mini-batch for reconstruction/sparsity metrics. "
@@ -1207,7 +1228,12 @@ def parse_args():
     parser.add_argument("--hyenadna_checkpoint_path", type=str, default=None)
     parser.add_argument("--layer_idx", type=int, default=None)
     parser.add_argument("--fidelity_batch_size", type=int, default=4)
-    parser.add_argument("--fidelity_max_seq_len", type=int, default=1024)
+    parser.add_argument(
+        "--fidelity_max_seq_len",
+        type=int,
+        default=512,
+        help="Must match BED window length used for HyenaDNA extraction (default 512).",
+    )
     parser.add_argument(
         "--resume",
         action="store_true",

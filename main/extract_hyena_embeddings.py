@@ -27,10 +27,21 @@ Notes:
 
 import argparse
 import os
+import sys
 from typing import List, Tuple
 
 import torch
 from transformers import AutoConfig, AutoModel, AutoTokenizer
+
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from utils.gpu_setup import (  # noqa: E402
+    configure_cuda_performance,
+    resolve_device_str,
+    tensor_to_device_fast,
+)
 
 try:
     from pyfaidx import Fasta
@@ -106,7 +117,8 @@ def main() -> None:
                     help="Storage dtype for embeddings (compute stays float32). float16 saves disk.")
     args = ap.parse_args()
 
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device_str(args.device)
+    configure_cuda_performance()
     print("Using device:", device)
 
     selected_layers = [int(x) for x in args.layers.split(",") if x.strip() != ""]
@@ -168,7 +180,7 @@ def main() -> None:
                 f"Check tokenizer behavior / special tokens."
             )
 
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+        inputs = {k: tensor_to_device_fast(v, device) for k, v in inputs.items()}
 
         out = model(**inputs, output_hidden_states=True, return_dict=True)
         hs = out.hidden_states  # tuple of (B, L, D)

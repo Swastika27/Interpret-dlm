@@ -59,7 +59,19 @@ import numpy as np
 import torch
 
 import sys
+
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 sys.path.insert(0, os.path.dirname(__file__))
+
+from utils.genomics_coords import infer_use_chr_from_save_dir  # type: ignore
+from utils.gpu_setup import (  # type: ignore
+    configure_cuda_performance,
+    resolve_device_str,
+    tensor_to_device_fast,
+)
 
 from concept_feature_analysis import (  # type: ignore
     BEDIndex,
@@ -130,6 +142,7 @@ class OnlineCorr:
 def _iter_shard_token_batches(
     shard_paths: Sequence[str],
     batch_size: int,
+    use_chr: bool,
 ) -> Iterable[Tuple[torch.Tensor, Dict[str, np.ndarray]]]:
     """
     Yield batches of token embeddings plus aligned per-token stats.
@@ -154,7 +167,7 @@ def _iter_shard_token_batches(
 
         # genomic midpoints per token
         if coords_raw is not None:
-            _chroms, genomic_mid = _build_token_positions(coords_raw, L)
+            _chroms, genomic_mid = _build_token_positions(coords_raw, L, use_chr)
         else:
             genomic_mid = np.zeros(B * L, dtype=np.int64)
 
@@ -180,13 +193,14 @@ def _compute_activation_frequencies(
     sae,
     shard_paths: Sequence[str],
     batch_size: int,
+    use_chr: bool,
 ) -> Tuple[np.ndarray, int]:
     """Return (freq_per_feature [dict_size], n_tokens_total)."""
     dict_size = int(getattr(sae, "dict_size"))
     act_sum = np.zeros(dict_size, dtype=np.int64)
     n_total = 0
 
-    for x, _stats in _iter_shard_token_batches(shard_paths, batch_size):
+    for x, _stats in _iter_shard_token_batches(shard_paths, batch_size, use_chr):
         acts = get_activations(sae, x, return_cpu=False)
         active = (acts > 0).cpu().numpy()
         act_sum += active.sum(axis=0).astype(np.int64)
@@ -202,6 +216,7 @@ def _compute_bed_counts(
     bed_indices: List[BEDIndex],
     batch_size: int,
     act_size: int,
+    use_chr: bool,
 ) -> dict:
     """
     Streaming version of concept_feature_analysis accumulation but returns counts
@@ -229,7 +244,7 @@ def _compute_bed_counts(
             raise KeyError(
                 f"Shard {os.path.basename(shard_path)} missing 'coords' which is required for BED labeling."
             )
-        chroms, positions = _build_token_positions(coords_raw, L)
+        chroms, positions = _build_token_positions(coords_raw, L, use_chr)
         token_labels = np.zeros((B * L, n_concepts), dtype=bool)
         chroms_arr = np.asarray(chroms)
         for ch in np.unique(chroms_arr):
@@ -317,7 +332,7 @@ def _per_dim_mse(
 
         for start in range(0, x_flat.shape[0], batch_size):
             end = min(start + batch_size, x_flat.shape[0])
-            x = x_flat[start:end].to(device)
+            x = tensor_to_device_fast(x_flat[start:end], device)
             recon, _acts = sae(x)
             resid = (x - recon).float()
             if per_dim_sum is None:
@@ -339,6 +354,7 @@ def _dense_feature_correlations(
     batch_size: int,
     device: str,
     dense_feature_indices: Sequence[int],
+    use_chr: bool,
 ) -> Dict[int, Dict[str, float]]:
     """
     For each dense feature, compute corr(feature_act, stat) for:
@@ -361,8 +377,8 @@ def _dense_feature_correlations(
         for i in dense_feature_indices
     }
 
-    for x_cpu, stats in _iter_shard_token_batches(shard_paths, batch_size):
-        x = x_cpu.to(device)
+    for x_cpu, stats in _iter_shard_token_batches(shard_paths, batch_size, use_chr):
+        x = tensor_to_device_fast(x_cpu, device)
         recon, acts = sae(x)  # acts [b, dict]
         acts_cpu = acts.detach().float().cpu().numpy()
 
@@ -395,7 +411,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--splits", nargs="+", default=["test"])
     p.add_argument("--bed_dir", required=True, help="Directory containing *.bed concept annotation files")
     p.add_argument("--out_dir", required=True)
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument(
+        "--device",
+        default=None,
+        help="cuda (default if available), cpu, … — falls back to CPU if CUDA unavailable.",
+    )
     p.add_argument("--eval_batch_size", type=int, default=2048)
 
     p.add_argument("--dense_top_n", type=int, default=8, help="Always treat top-N freq features as dense")
@@ -423,6 +443,9 @@ def _checkpoint_name(path: str) -> str:
 
 def main() -> None:
     args = parse_args()
+    args.device = resolve_device_str(args.device)
+    configure_cuda_performance()
+
     os.makedirs(args.out_dir, exist_ok=True)
 
     with open(args.sae_cfg, "r", encoding="utf-8") as fh:
@@ -435,7 +458,9 @@ def main() -> None:
     bed_paths = sorted(glob.glob(os.path.join(args.bed_dir, "*.bed")))
     if not bed_paths:
         raise FileNotFoundError(f"No .bed files found in {args.bed_dir}")
-    bed_indices = [BEDIndex(p) for p in bed_paths]
+    use_chr = infer_use_chr_from_save_dir(args.save_dir, list(args.splits), args.layer)
+    print(f"Chromosome naming (match embeddings): use_chr={use_chr}")
+    bed_indices = [BEDIndex(p, use_chr=use_chr) for p in bed_paths]
 
     ckpt_paths = sorted(glob.glob(args.checkpoints_glob))
     if not ckpt_paths:
@@ -452,7 +477,9 @@ def main() -> None:
         sae = load_sae(cfg, ckpt, args.device)
 
         # 1) dense features by activation frequency
-        freq, n_tokens = _compute_activation_frequencies(sae, shard_paths, args.eval_batch_size)
+        freq, n_tokens = _compute_activation_frequencies(
+            sae, shard_paths, args.eval_batch_size, use_chr
+        )
         order = np.argsort(freq)[::-1]
         top_n = int(min(args.dense_top_n, order.size))
         dense_top = order[:top_n].astype(int).tolist()
@@ -473,6 +500,7 @@ def main() -> None:
             bed_indices=bed_indices,
             batch_size=args.eval_batch_size,
             act_size=int(cfg["act_size"]),
+            use_chr=use_chr,
         )
         f1_full = _f1_matrix_from_counts(counts)  # [C,F]
         assoc_full = (f1_full >= float(args.assoc_f1_threshold))
@@ -493,6 +521,7 @@ def main() -> None:
             batch_size=args.eval_batch_size,
             device=args.device,
             dense_feature_indices=dense_set[: max(0, min(len(dense_set), 64))],  # hard cap for runtime safety
+            use_chr=use_chr,
         )
 
         # 3) per-dim MSE and overlap with dense features (decoder energy on bad dims)

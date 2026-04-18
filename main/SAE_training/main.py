@@ -1,5 +1,14 @@
 #%%
 import argparse
+import os
+import sys
+
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from utils.gpu_setup import configure_cuda_performance, resolve_device_str
+
 from training import train_sae_wo_model
 from sae import VanillaSAE, TopKSAE, BatchTopKSAE, JumpReLUSAE, GatedSAE
 from activation_store import StreamingActivationsStore
@@ -50,8 +59,12 @@ def parse_args():
                         help="Do not override Adam betas to beta1=0, beta2=0.999 for gated SAE")
     parser.add_argument("--act_size", type=int, default=256,
                         help="Activation size (input dimensionality)")
-    parser.add_argument("--device", type=str, default="cuda",
-                        help="Device to use (cuda/cpu)")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="cuda (default if available), cpu, … — falls back to CPU if CUDA unavailable.",
+    )
     parser.add_argument("--bandwidth", type=float, default=0.001,
                         help="Bandwidth parameter for JumpReLU SAE")
     parser.add_argument("--perf_log_freq", type=int, default=100,
@@ -84,6 +97,9 @@ def make_json_serializable(obj):
 
 def main():
     args = parse_args()
+
+    args.device = resolve_device_str(args.device)
+    configure_cuda_performance()
 
     cfg = get_default_cfg()
 

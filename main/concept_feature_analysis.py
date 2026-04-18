@@ -77,7 +77,18 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 import sys
+
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 sys.path.insert(0, os.path.dirname(__file__))
+from utils.genomics_coords import (
+    infer_use_chr_from_save_dir,
+    infer_use_chr_from_chroms,
+    normalize_chrom_name,
+)
+from utils.gpu_setup import configure_cuda_performance, resolve_device_str
 from SAE_training.sae import (
     BatchTopKSAE,
     TopKSAE,
@@ -125,25 +136,37 @@ class BEDIndex:
 
     Storage: two numpy int64 arrays per chrom (starts, ends), sorted by start.
 
+    Chromosome names are normalized with the same ``chr`` convention as embedding
+    coords (``use_chr``). If ``use_chr`` is None, it is inferred from this BED file.
+
     Scalar query  – contains(chrom, pos)
     Batch query   – contains_batch(chrom, positions[])   <- hot path
     """
 
-    def __init__(self, bed_path: str):
+    def __init__(self, bed_path: str, use_chr: Optional[bool] = None):
         self.name = Path(bed_path).stem
         self._starts: Dict[str, np.ndarray] = {}
         self._ends:   Dict[str, np.ndarray] = {}
+        self._use_chr: Optional[bool] = use_chr
         self._load(bed_path)
 
     def _load(self, path: str):
-        raw: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+        rows: List[Tuple[str, int, int]] = []
         with open(path) as fh:
             for line in fh:
                 line = line.strip()
                 if not line or line.startswith(("#", "track", "browser")):
                     continue
                 parts = line.split("\t") if "\t" in line else line.split()
-                raw[parts[0]].append((int(parts[1]), int(parts[2])))
+                rows.append((parts[0], int(parts[1]), int(parts[2])))
+
+        if self._use_chr is None:
+            self._use_chr = infer_use_chr_from_chroms([c for c, _, _ in rows]) if rows else True
+
+        raw: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+        for chrom, s, e in rows:
+            k = normalize_chrom_name(chrom, self._use_chr)
+            raw[k].append((s, e))
 
         total = 0
         for chrom, ivs in raw.items():
@@ -153,12 +176,13 @@ class BEDIndex:
             self._ends[chrom]   = arr[:, 1]
             total += len(ivs)
         print(f"  Loaded BED '{self.name}': {total} intervals "
-              f"across {len(self._starts)} chroms")
+              f"across {len(self._starts)} chroms (use_chr={self._use_chr})")
 
     # ------------------------------------------------------------------
     # Scalar query
     # ------------------------------------------------------------------
     def contains(self, chrom: str, pos: int) -> bool:
+        chrom = normalize_chrom_name(chrom, self._use_chr)  # type: ignore[arg-type]
         starts = self._starts.get(chrom)
         if starts is None:
             return False
@@ -181,6 +205,7 @@ class BEDIndex:
         positions : 1-D int64 array of genomic positions (0-based).
         Returns   : bool array of the same length.
         """
+        chrom = normalize_chrom_name(chrom, self._use_chr)  # type: ignore[arg-type]
         starts = self._starts.get(chrom)
         if starts is None:
             return np.zeros(len(positions), dtype=bool)
@@ -258,7 +283,11 @@ def get_activations(sae, x: torch.Tensor, return_cpu: bool = True) -> torch.Tens
     """
     dtype  = next(sae.parameters()).dtype
     device = next(sae.parameters()).device
-    x = x.to(device=device, dtype=dtype)
+    x = x.to(
+        device=device,
+        dtype=dtype,
+        non_blocking=(device.type == "cuda"),
+    )
 
     if isinstance(sae, RawNeuronSAE):
         out = F.relu(x).float()
@@ -291,9 +320,12 @@ def get_activations(sae, x: torch.Tensor, return_cpu: bool = True) -> torch.Tens
 def _build_token_positions(
     coords_raw: list,
     L: int,
+    use_chr: bool,
 ) -> Tuple[List[str], np.ndarray]:
     """
     Pre-compute the genomic mid-point for every (sequence, token) pair.
+
+    Chromosome strings are normalized with ``use_chr`` to match BEDIndex.
 
     Returns
     -------
@@ -305,12 +337,13 @@ def _build_token_positions(
     positions = np.empty(B * L, dtype=np.int64)
 
     for seq_i, (chrom, seq_start, seq_end) in enumerate(coords_raw):
+        cnorm = normalize_chrom_name(str(chrom), use_chr)
         bp_per_token = (seq_end - seq_start) / L
         tok_indices  = np.arange(L, dtype=np.float64)
         mids         = (seq_start + (tok_indices + 0.5) * bp_per_token).astype(np.int64)
         base         = seq_i * L
         positions[base: base + L] = mids
-        chroms.extend([chrom] * L)
+        chroms.extend([cnorm] * L)
 
     return chroms, positions
 
@@ -337,6 +370,7 @@ def accumulate_shard(
     batch_size: int,
     device: str,
     counts: dict,
+    use_chr: bool,
 ) -> None:
     """
     Load one shard, assign labels, run SAE encoder, binarise activations,
@@ -356,7 +390,7 @@ def accumulate_shard(
 
     # ---- 1. Vectorised token labelling --------------------------------
     print("      Labelling tokens ...")
-    chroms, positions = _build_token_positions(coords_raw, L)
+    chroms, positions = _build_token_positions(coords_raw, L, use_chr)
 
     token_labels = np.zeros((B * L, n_concepts), dtype=bool)
     chroms_arr = np.array(chroms)
@@ -571,8 +605,11 @@ def parse_args():
     p.add_argument("--bed_dir",        required=True,
                    help="Directory containing *.bed concept annotation files")
     p.add_argument("--out_dir",        required=True)
-    p.add_argument("--device",
-                   default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument(
+        "--device",
+        default=None,
+        help="cuda (default if available), cpu, … — falls back to CPU if CUDA unavailable.",
+    )
     p.add_argument("--batch_size",     type=int, default=2048)
     p.add_argument("--top_k_features", type=int, default=10)
     p.add_argument("--seed",           type=int, default=42)
@@ -807,6 +844,9 @@ def _cofa_read_summary_row_from_top_csv(concept_dir: str) -> Optional[dict]:
 
 def main():
     args = parse_args()
+    args.device = resolve_device_str(args.device)
+    configure_cuda_performance()
+
     exclude_set = (
         load_excluded_feature_indices_json(list(args.exclude_feature_indices_json))
         if args.exclude_feature_indices_json
@@ -845,7 +885,9 @@ def main():
     if not bed_paths:
         raise FileNotFoundError(f"No .bed files found in {args.bed_dir}")
     print(f"\nFound {len(bed_paths)} BED concept files:")
-    bed_indices = [BEDIndex(p) for p in bed_paths]
+    use_chr = infer_use_chr_from_save_dir(args.save_dir, args.splits, args.layer)
+    print(f"  Chromosome naming (match embeddings): use_chr={use_chr}")
+    bed_indices = [BEDIndex(p, use_chr=use_chr) for p in bed_paths]
     n_concepts  = len(bed_indices)
     bed_basenames = [Path(p).name for p in bed_paths]
 
@@ -932,6 +974,7 @@ def main():
             batch_size  = args.batch_size,
             device      = args.device,
             counts      = counts,
+            use_chr     = use_chr,
         )
         total_shards += 1
         done_keys.add(sk)
