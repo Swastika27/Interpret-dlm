@@ -9,13 +9,11 @@ filtering out:
 - centromere regions (BED)
 
 Then split windows by chromosome:
-- Train: chr1–chr19
-- Val: chr20–chr21
-- Test: chr22 + chrX
+- Train: chr1–chr20
+- Test: chr21, chr22, chrX
 
 Outputs BED files:
   out_dir/train_windows.bed
-  out_dir/val_windows.bed
   out_dir/test_windows.bed
 
 Notes:
@@ -142,9 +140,8 @@ def main() -> None:
     os.makedirs(args.out_dir, exist_ok=True)
 
     chroms = [c.strip() for c in args.chroms.split(",") if c.strip()]
-    train_chroms = {f"chr{i}" for i in range(1, 20)}
-    val_chroms = {"chr20", "chr21"}
-    test_chroms = {"chr22", "chrX"}
+    train_chroms = {f"chr{i}" for i in range(1, 21)}
+    test_chroms = {"chr21", "chr22", "chrX"}
 
     # Load genome
     fa = Fasta(args.fasta, as_raw=True, sequence_always_upper=False)  # keep case; we count N/n anyway
@@ -162,15 +159,13 @@ def main() -> None:
 
     # Output writers
     train_path = os.path.join(args.out_dir, "train_windows.bed")
-    val_path = os.path.join(args.out_dir, "val_windows.bed")
     test_path = os.path.join(args.out_dir, "test_windows.bed")
 
     train_f = open(train_path, "w", encoding="utf-8")
-    val_f = open(val_path, "w", encoding="utf-8")
     test_f = open(test_path, "w", encoding="utf-8")
 
     # Counters
-    counts = {"train": 0, "val": 0, "test": 0, "skipped_n": 0, "skipped_excl": 0, "skipped_short": 0}
+    counts = {"train": 0, "test": 0, "skipped_n": 0, "skipped_excl": 0, "skipped_short": 0}
 
     for chrom in chroms:
         if chrom not in fa:
@@ -201,9 +196,6 @@ def main() -> None:
             if chrom in train_chroms:
                 train_f.write(line)
                 counts["train"] += 1
-            elif chrom in val_chroms:
-                val_f.write(line)
-                counts["val"] += 1
             elif chrom in test_chroms:
                 test_f.write(line)
                 counts["test"] += 1
@@ -211,13 +203,11 @@ def main() -> None:
             start += args.stride
 
     train_f.close()
-    val_f.close()
     test_f.close()
 
     # Print summary
     print("Wrote:")
     print(f"  {train_path}  ({counts['train']} windows)")
-    print(f"  {val_path}    ({counts['val']} windows)")
     print(f"  {test_path}   ({counts['test']} windows)")
     print("Skipped:")
     print(f"  excluded overlap: {counts['skipped_excl']}")

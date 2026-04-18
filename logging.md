@@ -265,7 +265,7 @@ python3 find_top_tokens_per_feature.py \
     --sae_cfg        trained_models/layer8_8192_batchtopk_32_0.0003/config.json \
     --save_dir       data/embeddings \
     --layer          8 \
-    --splits         train val test \
+    --splits         train test \
     --top_n          200 \
     --context_len    5 \
     --out_dir        results/layer8_8192_batchtopk_32_0.0003/top_tokens \
@@ -299,7 +299,7 @@ python concept_feature_analysis.py \
         --sae_cfg         runs/my_run/cfg.json \
         --save_dir        /data/embeddings \
         --layer           2 \
-        --splits          train val test \
+        --splits          train test \
         --bed_dir         concepts/ \
         --out_dir         results/concept_analysis \
         --device          cuda \

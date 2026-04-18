@@ -11,7 +11,7 @@ Usage:
         --sae_cfg         runs/my_run/cfg.json \
         --save_dir        /data/embeddings \
         --layer           2 \
-        --splits          train val test \
+        --splits          train test \
         --bed_dir         concepts/ \
         --out_dir         results/concept_analysis \
         --device          cuda \
@@ -517,9 +517,9 @@ def parse_args():
     )
     p.add_argument("--sae_cfg",        required=True)
     p.add_argument("--save_dir",       required=True,
-                   help="Root dir with train/val/test splits of shards")
+                   help="Root dir with train/test splits of shards")
     p.add_argument("--layer",          type=int, required=True)
-    p.add_argument("--splits",         nargs="+", default=["train", "val", "test"])
+    p.add_argument("--splits",         nargs="+", default=["train", "test"])
     p.add_argument("--bed_dir",        required=True,
                    help="Directory containing *.bed concept annotation files")
     p.add_argument("--out_dir",        required=True)

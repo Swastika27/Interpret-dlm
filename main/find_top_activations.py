@@ -2,7 +2,7 @@
 find_top_activations.py  (optimized)
 
 For each SAE feature, find the top-N tokens (by activation value) across
-train / val / test shards, and save them.
+train / test shards, and save them.
 
 Key optimizations over the original:
   1. Vectorized per-chunk topk — eliminates the O(chunk * n_features) Python loop.
@@ -18,7 +18,7 @@ Usage:
         --sae_cfg         runs/my_run/cfg.json \
         --embed_dir       /data/embeddings \
         --layer           2 \
-        --splits          train val test \
+        --splits          train test \
         --top_n           10 \
         --out_dir         results/top_activations \
         --device          cuda \
@@ -35,7 +35,7 @@ top_activations.pt keys:
     token_pos    LongTensor  [n_features, top_n]   position within the model window (0..L-1)
     coords       list[list[tuple]]                 [n_features][top_n] → (chrom,start,end) full window BED
     context_seqs list[list[str]]                   [n_features][top_n] → same window as "chrom:start-end" (llm_sae_interpreter CSV column)
-    split        list[list[str]]                   [n_features][top_n] → "train"/"val"/"test"
+    split        list[list[str]]                   [n_features][top_n] → split folder name (e.g. train/test)
     shard_path   list[list[str]]                   [n_features][top_n] → source shard file
     cfg          dict
 
@@ -429,9 +429,9 @@ def parse_args():
     p = argparse.ArgumentParser(description="Find top-N activating tokens per SAE feature (optimized).")
     p.add_argument("--sae_checkpoint", required=True, help="Path to SAE .pt checkpoint")
     p.add_argument("--sae_cfg",        required=True, help="Path to SAE cfg JSON file")
-    p.add_argument("--embed_dir",      required=True, help="Root dir containing train/val/test splits")
+    p.add_argument("--embed_dir",      required=True, help="Root dir containing train/test shard folders")
     p.add_argument("--layer",          type=int, required=True, help="Which layer's embeddings to use")
-    p.add_argument("--splits",         nargs="+", default=["train", "val", "test"])
+    p.add_argument("--splits",         nargs="+", default=["train", "test"])
     p.add_argument("--top_n",          type=int, default=10,   help="Top-N tokens per feature")
     p.add_argument("--out_dir",        required=True,          help="Where to write results")
     p.add_argument("--device",         default="cuda" if torch.cuda.is_available() else "cpu")

@@ -46,34 +46,28 @@ python3 data_utils/make_windows.py \
 
 
 echo "Total windows after removing blacklist and centromere regions:"
-wc -l train.bed
-wc -l val.bed
-wc -l test.bed
+wc -l data/preprocessed/train_windows.bed
+wc -l data/preprocessed/test_windows.bed
 # conda install -c bioconda bedtools
 # split into windows length <= seq_len
 
-bedtools makewindows -b train.bed -w $seq_len > train.w${seq_len}.bed
-bedtools makewindows -b val.bed   -w $seq_len > val.w${seq_len}.bed
-bedtools makewindows -b test.bed  -w $seq_len > test.w${seq_len}.bed
+bedtools makewindows -b data/preprocessed/train_windows.bed -w $seq_len > train.w${seq_len}.bed
+bedtools makewindows -b data/preprocessed/test_windows.bed -w $seq_len > test.w${seq_len}.bed
 
 echo "Total windows before filtering:"
 wc -l train.w${seq_len}.bed
-wc -l val.w${seq_len}.bed
 wc -l test.w${seq_len}.bed
 
 # remove windows lenght less than < L
 awk -v L=$seq_len '($3-$2)==L' train.w${seq_len}.bed > train.w${seq_len}.full.bed
-awk -v L=$seq_len '($3-$2)==L' val.w${seq_len}.bed   > val.w${seq_len}.full.bed
 awk -v L=$seq_len '($3-$2)==L' test.w${seq_len}.bed  > test.w${seq_len}.full.bed
 
 echo "Total windows after filtering:"
 wc -l train.w${seq_len}.full.bed
-wc -l val.w${seq_len}.full.bed
 wc -l test.w${seq_len}.full.bed
 
-shuf --random-source=<(openssl enc -aes-256-ctr -pass pass:$SEED -nosalt </dev/zero 2>/dev/null) -n $N_TRAIN train.w${seq_len}.full.bed > train.sub.bed
-shuf --random-source=<(openssl enc -aes-256-ctr -pass pass:$SEED -nosalt </dev/zero 2>/dev/null) -n $N_VAL val.w${seq_len}.full.bed > val.sub.bed
-shuf --random-source=<(openssl enc -aes-256-ctr -pass pass:$SEED -nosalt </dev/zero 2>/dev/null) -n $N_TEST test.w${seq_len}.full.bed > test.sub.bed
+shuf --random-source=<(openssl enc -aes-256-ctr -pass pass:$SEED -nosalt </dev/zero 2>/dev/null) -n $N_TRAIN train.w${seq_len}.full.bed > data/preprocessed/train.sub.bed
+shuf --random-source=<(openssl enc -aes-256-ctr -pass pass:$SEED -nosalt </dev/zero 2>/dev/null) -n $N_TEST test.w${seq_len}.full.bed > data/preprocessed/test.sub.bed
 
 # run hyena docker container to use hyena model for embedding extraction
 CONTAINER_NAME="hyena"
@@ -140,8 +134,8 @@ python main/BatchTopK/main.py \
 
 
 disk2_embed_dir=/workspace/mnt/disk2/2005027/data/embeddings
-# generate embeddings for val and test splits (optional, can also be done before training)
-for split in "val" "test"; do
+# generate embeddings for test split (optional, can also be done before training)
+for split in "test"; do
     if [ ! -d "$disk2_embed_dir/$split/layer_${layer}" ]; then
         echo "Did not find directory $disk2_embed_dir/$split/layer_${layer}, extracting embeddings..."
         echo "Extracting embeddings for $split split..."
@@ -162,19 +156,17 @@ for split in "val" "test"; do
     fi
 done
 
-# Evaluate on val and test split
+# Evaluate on test split (val_* args point at test data so evaluate_sae still runs both sections)
 # need to run inside docker container since we need to patch hyena model
-echo "Evaluating on val and test splits..."
+echo "Evaluating on test split..."
 docker exec $CONTAINER_NAME bash -c "
     cd $docker_wdr &&
     python main/evaluate_sae.py \
       --sae_path "trained_models/$model_basename/checkpoints/step_$(($N_TRAIN - 1)).pt" \
       --cfg_path "trained_models/$model_basename/config.json" \
-      --val_embeddings_path $docker_base/$disk2_embed_dir/val/layer_${layer} \
-      --test_embeddings_path $disk2_embed_dir/test/layer_${layer} \
+      --test_embeddings_path $docker_base/$disk2_embed_dir/test/layer_${layer} \
       --output_file "results/$model_basename/eval_metrics.yaml" \
       --device_str cuda \
-      --val_bed_path data/preprocessed/val.sub.bed \
       --test_bed_path data/preprocessed/test.sub.bed \
       --genome_path data/raw/GRCh38.primary_assembly.genome.fa \
       --hyenadna_checkpoint_path LongSafari/hyenadna-large-1m-seqlen-hf \
@@ -188,7 +180,7 @@ python main/find_top_activations.py \
         --sae_cfg         trained_models/$model_basename/config.json \
         --embed_dir       $disk2_embed_dir \
         --layer           $layer \
-        --splits          val test \
+        --splits          test \
         --top_n           200 \
         --out_dir         results/top_activations \
         --device          cuda \

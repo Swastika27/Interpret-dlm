@@ -99,7 +99,7 @@ else
     docker start $CONTAINER_NAME
 fi
 
-# for split in "val" "test"; do
+# for split in "test"; do
 #     if [ ! -d "$disk2_embed_dir/$split/layer_${layer}" ]; then
 #         echo "Did not find directory $disk2_embed_dir/$split/layer_${layer}, extracting embeddings..."
 #         echo "Extracting embeddings for $split split..."
@@ -140,8 +140,8 @@ for ckpt_step in "${EPOCH_CKPTS[@]}"; do
   result_tag="${model_basename}/step${ckpt_step}"
   echo "========== Pipeline for checkpoint step ${ckpt_step} ($result_tag) =========="
 
-  # Evaluate on val and test split (HyenaDNA fidelity — run inside docker)
-  echo "Evaluating on val and test splits..."
+  # Evaluate on test split embeddings (HyenaDNA fidelity — run inside docker)
+  echo "Evaluating on test split..."
   if [ -f "results/$result_tag/eval_metrics.yaml" ]; then
     echo "Output file already exists. Skipping..."
   else
@@ -154,18 +154,15 @@ for ckpt_step in "${EPOCH_CKPTS[@]}"; do
     python main/evaluate_sae.py \
       --sae_path ${CHECKPOINT_DIR}/step_${ckpt_step}.pt \
       --cfg_path trained_models/$model_basename/config.json \
-      --val_embeddings_path $docker_base/$disk2_embed_dir/val/layer_${layer} \
       --test_embeddings_path $docker_base/$disk2_embed_dir/test/layer_${layer} \
       --output_file results/$result_tag/eval_metrics.yaml \
       --device cuda \
       --resume \
-      --val_bed_path data/preprocessed/val.sub.bed \
       --test_bed_path data/preprocessed/test.sub.bed \
       --genome_path data/raw/GRCh38.primary_assembly.genome.fa \
       --hyenadna_checkpoint_path LongSafari/hyenadna-large-1m-seqlen-hf \
       --fidelity_max_seq_len $seq_len \
-      --layer_idx $(($layer - 1)) \
-      --resume
+      --layer_idx $(($layer - 1))
      "
   fi
 
@@ -223,7 +220,7 @@ PY
       --checkpoints_glob ${CHECKPOINT_DIR}/step_${ckpt_step}.pt \
       --save_dir $disk2_embed_dir \
       --layer $layer \
-      --splits val test \
+      --splits test \
       --bed_dir all_annotations/ \
       --out_dir results/$result_tag/epoch_diagnostics \
       --device cuda \
@@ -239,7 +236,7 @@ PY
   #   --sae_cfg         trained_models/$model_basename/config.json \
   #   --embed_dir       $disk2_embed_dir \
   #   --layer           $layer \
-  #   --splits          val test \
+  #   --splits          test \
   #   --top_n           200 \
   #   --out_dir         results/$result_tag/top_activations \
   #   --device          cuda \
@@ -263,7 +260,7 @@ PY
     --sae_cfg         trained_models/$model_basename/config.json \
     --save_dir        $disk2_embed_dir \
     --layer           $layer \
-    --splits          val test \
+    --splits          test \
     --bed_dir         all_annotations/ \
     --out_dir         results/$result_tag/feature_concept_analysis \
     --device          cuda \
@@ -282,7 +279,7 @@ PY
     --sae_cfg         trained_models/$model_basename/config.json \
     --save_dir        $disk2_embed_dir \
     --layer           $layer \
-    --splits          val test \
+    --splits          test \
     --bed_dir         all_annotations/ \
     --out_dir         results/$result_tag/neuron_concept_analysis \
     --device          cuda \

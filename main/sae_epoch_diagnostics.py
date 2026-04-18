@@ -33,7 +33,7 @@ python main/sae_epoch_diagnostics.py ^
   --checkpoints_glob runs/my_run/checkpoint_*.pt ^
   --save_dir data/embeddings ^
   --layer 6 ^
-  --splits val test ^
+  --splits test ^
   --bed_dir concepts/ ^
   --out_dir results/epoch_diagnostics ^
   --device cuda ^
@@ -392,7 +392,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoints_glob", required=True, help="Glob for SAE checkpoints (e.g. runs/x/checkpoint_*.pt)")
     p.add_argument("--save_dir", required=True, help="Root dir with split/layer_{k}/shard_*.pt (must include coords)")
     p.add_argument("--layer", type=int, required=True)
-    p.add_argument("--splits", nargs="+", default=["val", "test"])
+    p.add_argument("--splits", nargs="+", default=["test"])
     p.add_argument("--bed_dir", required=True, help="Directory containing *.bed concept annotation files")
     p.add_argument("--out_dir", required=True)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")

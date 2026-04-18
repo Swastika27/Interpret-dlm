@@ -16,20 +16,20 @@ This script calculates three key metrics:
 3. Downstream task fidelity (loss recovered on next-token prediction)
 
 Usage:
-    # With pre-saved embeddings (val and test sets):
+    # Test split only (typical after merging val+test); optional train:
     python evaluate_sae_hyenadna.py \
         --sae_path models/my_sae/ae.pt \
-        --val_embeddings_path data/val_embeddings/ \
-        --test_embeddings_path data/test_embeddings/ \
+        --test_embeddings_path data/embeddings/test/layer_6 \
         --output_file results/eval_metrics.yaml
 
-    # With fidelity evaluation (requires sequences + HyenaDNA checkpoint):
+    # Optional: add --val_embeddings_path / --val_bed_path if you still keep a val shard dir.
+
+    # With fidelity (per split that has a BED): supply genome + HyenaDNA + layer, and
+    # --test_bed_path / --train_bed_path / --val_bed_path as needed:
     python evaluate_sae_hyenadna.py \
         --sae_path models/my_sae/ae.pt \
-        --val_embeddings_path data/val_embeddings/ \
-        --test_embeddings_path data/test_embeddings/ \
-        --val_bed_path data/val_sequences.bed \
-        --test_bed_path data/test_sequences.bed \
+        --test_embeddings_path data/embeddings/test/layer_6 \
+        --test_bed_path data/preprocessed/test.sub.bed \
         --genome_path data/genome.fasta \
         --hyenadna_checkpoint_path pretrained/hyenadna-medium-160k \
         --layer_idx 8 \
@@ -897,14 +897,16 @@ class HyenaDNAFidelityEvaluator:
 def evaluate_sae(
     sae_path: str,
     cfg_path: str,
-    val_embeddings_path: Path,
     test_embeddings_path: Path,
     output_file: Optional[Path] = None,
     device_str: str = "cuda",
     eval_batch_size: int = 4096,
+    val_embeddings_path: Optional[Path] = None,
+    train_embeddings_path: Optional[Path] = None,
     # Fidelity args (all optional — skip fidelity if not provided)
     val_bed_path: Optional[Path] = None,
     test_bed_path: Optional[Path] = None,
+    train_bed_path: Optional[Path] = None,
     genome_path: Optional[Path] = None,
     hyenadna_checkpoint_path: Optional[str] = None,
     layer_idx: Optional[int] = None,
@@ -913,26 +915,25 @@ def evaluate_sae(
     resume: bool = True,
 ):
     """
-    Evaluate SAE on pre-saved val and test embeddings stored as sharded .pt files.
+    Evaluate SAE on pre-saved test embeddings (required) and optionally val / train dirs.
 
-    Each embeddings directory should contain shard_*.pt files, where each shard
-    is a dict {"emb": tensor of shape [B, L, D]}.  Metric computation streams
-    shards in mini-batches of `eval_batch_size` tokens so that the full token
-    matrix is never materialised on the GPU.
+    Validation is optional so you can use a single held-out test shard directory
+    (e.g. after merging val+test). Each embeddings directory should contain
+    shard_*.pt files with dict {\"emb\": tensor [B, L, D]}.
 
     Args:
         sae_path: Path to SAE .pt checkpoint file
         cfg_path: Path to SAE config JSON file
-        val_embeddings_path: Directory containing val shard_*.pt files
-        test_embeddings_path: Directory containing test shard_*.pt files
+        test_embeddings_path: Directory containing test shard_*.pt files (required)
+        val_embeddings_path: Optional directory with val shard_*.pt files
+        train_embeddings_path: Optional directory with train shard_*.pt files
         output_file: Path to save YAML results (default: print to stdout)
         device_str: Torch device string (e.g. "cuda", "cpu")
         eval_batch_size: Tokens per mini-batch for reconstruction/sparsity
                          metrics.  Reduce if you still hit OOM (default 4096).
-        val_bed_path: BED file for val sequences — required for fidelity
-        test_bed_path: BED file for test sequences — required for fidelity
-        genome_path: Path to genome FASTA — required for fidelity
-        hyenadna_checkpoint_path: HuggingFace model ID or local path to HyenaDNA checkpoint
+        val_bed_path / test_bed_path / train_bed_path: BED for fidelity on that split
+        genome_path: Path to genome FASTA — required for any fidelity
+        hyenadna_checkpoint_path: HuggingFace model ID or local HyenaDNA path
         layer_idx: Layer to patch for fidelity evaluation
         fidelity_batch_size: Batch size for fidelity (unused, kept for future batching)
         fidelity_max_seq_len: Truncate sequences to this length for fidelity eval
@@ -940,21 +941,20 @@ def evaluate_sae(
                 requires --output_file. State lives beside the YAML output.
     """
 
+    # Fidelity runs per split when global deps are set and that split has a BED path.
     run_fidelity = all([
-        val_bed_path is not None,
-        test_bed_path is not None,
         genome_path is not None,
         hyenadna_checkpoint_path is not None,
         layer_idx is not None,
     ])
 
     if not run_fidelity and any([
-        val_bed_path, test_bed_path, genome_path, hyenadna_checkpoint_path, layer_idx
+        val_bed_path, test_bed_path, train_bed_path, genome_path, hyenadna_checkpoint_path, layer_idx is not None
     ]):
         print(
-            "⚠️  Partial fidelity args provided. To run fidelity, supply ALL of:\n"
-            "   --val_bed_path, --test_bed_path, --genome_path,\n"
-            "   --hyenadna_checkpoint_path, --layer_idx\n"
+            "⚠️  Partial fidelity args provided. To run fidelity on a split, supply ALL of:\n"
+            "   --genome_path, --hyenadna_checkpoint_path, --layer_idx,\n"
+            "   and --*_bed_path for each split where you want fidelity.\n"
             "Skipping fidelity evaluation."
         )
 
@@ -962,7 +962,10 @@ def evaluate_sae(
     print("SAE Evaluation (HyenaDNA / pre-saved embeddings)")
     print("=" * 70)
     print(f"SAE:              {sae_path}")
-    print(f"Val embeddings:   {val_embeddings_path}")
+    if train_embeddings_path is not None:
+        print(f"Train embeddings: {train_embeddings_path}")
+    if val_embeddings_path is not None:
+        print(f"Val embeddings:   {val_embeddings_path}")
     print(f"Test embeddings:  {test_embeddings_path}")
     if run_fidelity:
         print(f"HyenaDNA:         {hyenadna_checkpoint_path}")
@@ -984,17 +987,22 @@ def evaluate_sae(
 
     results = {
         "sae_path": str(sae_path),
-        "val_embeddings_path": str(val_embeddings_path),
         "test_embeddings_path": str(test_embeddings_path),
         "sae_dict_size": cfg['dict_size'],
         "sae_activation_dim": cfg['act_size'],
     }
+    if val_embeddings_path is not None:
+        results["val_embeddings_path"] = str(val_embeddings_path)
+    if train_embeddings_path is not None:
+        results["train_embeddings_path"] = str(train_embeddings_path)
 
-    # ---- Evaluate on each split ----
-    split_configs = [
-        ("val",  val_embeddings_path,  val_bed_path),
-        ("test", test_embeddings_path, test_bed_path),
-    ]
+    # ---- Evaluate on each split (train → val → test when present) ----
+    split_configs: List[Tuple[str, Path, Optional[Path]]] = []
+    if train_embeddings_path is not None:
+        split_configs.append(("train", train_embeddings_path, train_bed_path))
+    if val_embeddings_path is not None:
+        split_configs.append(("val", val_embeddings_path, val_bed_path))
+    split_configs.append(("test", test_embeddings_path, test_bed_path))
 
     for split_name, emb_dir, bed_path in split_configs:
         if not emb_dir:
@@ -1054,7 +1062,7 @@ def evaluate_sae(
             print(f"  {k}: {fmt}")
 
         # 3. Fidelity
-        if run_fidelity:
+        if run_fidelity and bed_path is not None:
             print(f"\n--- 3. Fidelity — Loss Recovered ({split_name}) ---")
             fid_fp = _eval_fidelity_fingerprint(
                 split_fp,
@@ -1101,7 +1109,10 @@ def evaluate_sae(
                     )
         else:
             results[split_name]["fidelity"] = "skipped"
-            print(f"\n--- 3. Fidelity ({split_name}): SKIPPED ---")
+            if run_fidelity and bed_path is None:
+                print(f"\n--- 3. Fidelity ({split_name}): SKIPPED (no --*_bed_path for this split) ---")
+            else:
+                print(f"\n--- 3. Fidelity ({split_name}): SKIPPED ---")
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1135,10 +1146,24 @@ def parse_args():
     # Required args
     parser.add_argument("--sae_path", type=str, required=True)
     parser.add_argument("--cfg_path", type=str, required=True)
-    parser.add_argument("--val_embeddings_path", type=Path, required=True,
-                        help="Directory containing val shard_*.pt files")
-    parser.add_argument("--test_embeddings_path", type=Path, required=True,
-                        help="Directory containing test shard_*.pt files")
+    parser.add_argument(
+        "--val_embeddings_path",
+        type=Path,
+        default=None,
+        help="Optional: directory with val shard_*.pt files (omit if you only use test)",
+    )
+    parser.add_argument(
+        "--test_embeddings_path",
+        type=Path,
+        required=True,
+        help="Directory containing test shard_*.pt files",
+    )
+    parser.add_argument(
+        "--train_embeddings_path",
+        type=Path,
+        default=None,
+        help="Optional: directory containing train shard_*.pt files (adds results['train'])",
+    )
 
     # Optional args
     parser.add_argument("--output_file", type=Path, default=None)
@@ -1152,6 +1177,7 @@ def parse_args():
     # Fidelity args
     parser.add_argument("--val_bed_path", type=Path, default=None)
     parser.add_argument("--test_bed_path", type=Path, default=None)
+    parser.add_argument("--train_bed_path", type=Path, default=None)
     parser.add_argument("--genome_path", type=Path, default=None)
     parser.add_argument("--hyenadna_checkpoint_path", type=str, default=None)
     parser.add_argument("--layer_idx", type=int, default=None)
@@ -1171,13 +1197,15 @@ if __name__ == "__main__":
     evaluate_sae(
         sae_path=args.sae_path,
         cfg_path=args.cfg_path,
-        val_embeddings_path=args.val_embeddings_path,
         test_embeddings_path=args.test_embeddings_path,
         output_file=args.output_file,
+        val_embeddings_path=args.val_embeddings_path,
         device_str=args.device_str,
         eval_batch_size=args.eval_batch_size,
+        train_embeddings_path=args.train_embeddings_path,
         val_bed_path=args.val_bed_path,
         test_bed_path=args.test_bed_path,
+        train_bed_path=args.train_bed_path,
         genome_path=args.genome_path,
         hyenadna_checkpoint_path=args.hyenadna_checkpoint_path,
         layer_idx=args.layer_idx,
