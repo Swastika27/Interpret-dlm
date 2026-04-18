@@ -243,18 +243,26 @@ def load_sae(cfg: dict, checkpoint_path: str, device: str):
 
 
 @torch.no_grad()
-def get_activations(sae, x: torch.Tensor) -> torch.Tensor:
-    """x : (N, D)  ->  acts : (N, dict_size) float32 on CPU."""
+def get_activations(sae, x: torch.Tensor, return_cpu: bool = True) -> torch.Tensor:
+    """
+    x : (N, D) -> acts : (N, dict_size) float32.
+
+    If return_cpu is True (default), returns activations on CPU for backward compatibility.
+    If False, returns on the SAE device so callers can run top-k / thresholds on GPU
+    and copy only smaller bool masks or reduced tensors back to host.
+    """
     dtype  = next(sae.parameters()).dtype
     device = next(sae.parameters()).device
     x = x.to(device=device, dtype=dtype)
 
     if isinstance(sae, RawNeuronSAE):
-        return F.relu(x).float().cpu()
+        out = F.relu(x).float()
+        return out.cpu() if return_cpu else out
 
     if isinstance(sae, (JumpReLUInferenceSAE, GatedInferenceSAE)):
         _, acts = sae(x)
-        return acts.float().cpu()
+        out = acts.float()
+        return out.cpu() if return_cpu else out
 
     x, _, _ = sae.preprocess_input(x)
     x_cent  = x - sae.b_dec
@@ -267,7 +275,8 @@ def get_activations(sae, x: torch.Tensor) -> torch.Tensor:
         topk = torch.topk(acts, min(k, acts.shape[-1]), dim=-1)
         acts = torch.zeros_like(acts).scatter_(-1, topk.indices, topk.values)
 
-    return acts.float().cpu()
+    out = acts.float()
+    return out.cpu() if return_cpu else out
 
 
 # ---------------------------------------------------------------------------
@@ -364,8 +373,8 @@ def accumulate_shard(
     for start in range(0, B * L, batch_size):
         # print(f"      Running SAE on tokens {start} to {min(start + batch_size, B * L)} ...")
         end   = min(start + batch_size, B * L)
-        chunk = get_activations(sae, emb_flat[start:end]).numpy()
-        active_parts.append(chunk > 0)          # bool, 4x smaller than float32
+        acts = get_activations(sae, emb_flat[start:end], return_cpu=False)
+        active_parts.append((acts > 0).cpu().numpy())
     active = np.concatenate(active_parts, axis=0)   # (B*L, dict_size) bool
 
     # ---- 3. Accumulate counts per concept -----------------------------

@@ -187,8 +187,8 @@ def _compute_activation_frequencies(
     n_total = 0
 
     for x, _stats in _iter_shard_token_batches(shard_paths, batch_size):
-        acts = get_activations(sae, x).numpy()  # [b, dict_size] float32 on CPU
-        active = acts > 0
+        acts = get_activations(sae, x, return_cpu=False)
+        active = (acts > 0).cpu().numpy()
         act_sum += active.sum(axis=0).astype(np.int64)
         n_total += int(active.shape[0])
 
@@ -244,8 +244,8 @@ def _compute_bed_counts(
         active_parts: List[np.ndarray] = []
         for start in range(0, B * L, batch_size):
             end = min(start + batch_size, B * L)
-            chunk = get_activations(sae, emb_flat[start:end]).numpy()
-            active_parts.append(chunk > 0)
+            acts = get_activations(sae, emb_flat[start:end], return_cpu=False)
+            active_parts.append((acts > 0).cpu().numpy())
         active = np.concatenate(active_parts, axis=0)  # (B*L, dict_size) bool
 
         for ci in range(n_concepts):

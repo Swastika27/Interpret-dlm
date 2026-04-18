@@ -62,6 +62,7 @@ from tqdm import tqdm
 
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
+from concept_feature_analysis import get_activations  # type: ignore
 from SAE_training.sae import (
     BatchTopKSAE,
     TopKSAE,
@@ -117,16 +118,6 @@ def load_sae(cfg: dict, checkpoint_path: str, device: str):
 
     sae.eval().to(device)
     return sae
-
-
-@torch.no_grad()
-def get_activations(sae, x: torch.Tensor) -> torch.Tensor:
-    """Returns (N, n_features) float32 CPU tensor."""
-    x = x.to(next(sae.parameters()).device).to(next(sae.parameters()).dtype)
-    if isinstance(sae, (JumpReLUInferenceSAE, GatedInferenceSAE)):
-        _, acts = sae(x)
-        return acts.float().cpu()
-    raise NotImplementedError("Add activation extraction for your SAE type here.")
 
 
 def _window_bed_from_seq_coord(seq_coord, L: int) -> Optional[tuple]:
@@ -290,13 +281,13 @@ def process_shards(
         for start in range(0, B * L, batch_size):
             end      = min(start + batch_size, B * L)
             chunk    = emb_flat[start:end].to(device)
-            acts     = get_activations(sae, chunk)          # (chunk_size, n_features) CPU
+            acts     = get_activations(sae, chunk, return_cpu=False)
 
             k        = min(accumulator.top_n, acts.shape[0])
-            topk_vals, topk_local_idx = torch.topk(acts, k, dim=0)  # (k, n_features)
+            topk_vals, topk_local_idx = torch.topk(acts, k, dim=0)
 
             # Offset local sub-batch indices to shard-level flat indices
-            topk_flat_idx = topk_local_idx + start          # (k, n_features)
+            topk_flat_idx = topk_local_idx + start
 
             topk_vals     = topk_vals.to(accumulator.device)
             topk_flat_idx = topk_flat_idx.to(accumulator.device)

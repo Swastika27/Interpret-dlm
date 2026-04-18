@@ -31,6 +31,8 @@ class StreamingActivationsStore:
         # optional: shuffle tokens **within shard** to increase randomness
         perm = torch.randperm(x.size(0))
         x = x[perm]
+        if self.device.type == "cuda":
+            x = x.pin_memory()
         return x
 
     def next_batch(self):
@@ -54,4 +56,6 @@ class StreamingActivationsStore:
                 # If last batch in shard is smaller than batch_size, continue to next shard
                 continue
 
+            if self.device.type == "cuda":
+                return batch.to(self.device, non_blocking=True)
             return batch.to(self.device)

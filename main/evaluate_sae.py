@@ -78,6 +78,11 @@ from SAE_training.sae import (
 )
 
 
+def _metrics_accumulator_device(device: str) -> torch.device:
+    """Run Welford / sparsity accumulators on GPU when eval uses CUDA (fewer H2D syncs)."""
+    d = torch.device(device)
+    return d if d.type == "cuda" else torch.device("cpu")
+
 
 def restore_cfg_types(cfg):
     if isinstance(cfg.get("dtype"), str):
@@ -414,16 +419,17 @@ def calculate_reconstruction_metrics(
     Returns:
         dict with mse, variance_explained, per-dimension MSE stats, n_tokens.
     """
+    stat_dev = _metrics_accumulator_device(device)
     d_model = None
 
-    # Sufficient statistics for Chan's algorithm — kept on CPU to save VRAM
+    # Sufficient statistics for Chan's algorithm — on GPU when device is CUDA
     n_total  = 0
     x_mean   = None   # [d_model]
     x_M2     = None   # [d_model]
     res_mean = None   # [d_model]  (residual = x - recon)
     res_M2   = None
 
-    sq_err_sum  = torch.tensor(0.0)   # scalar accumulators (CPU)
+    sq_err_sum  = torch.tensor(0.0, device=stat_dev)
     per_dim_mse_sum = None            # [d_model]
 
     completed: Set[str] = set()
@@ -440,12 +446,12 @@ def calculate_reconstruction_metrics(
             if st and int(st.get("n_total", 0)) > 0:
                 d_model = int(st["d_model"])
                 n_total = int(st["n_total"])
-                x_mean  = st["x_mean"].cpu().float()
-                x_M2    = st["x_M2"].cpu().float()
-                res_mean = st["res_mean"].cpu().float()
-                res_M2   = st["res_M2"].cpu().float()
-                sq_err_sum = st["sq_err_sum"].cpu().float()
-                per_dim_mse_sum = st["per_dim_mse_sum"].cpu().float()
+                x_mean  = st["x_mean"].to(stat_dev).float()
+                x_M2    = st["x_M2"].to(stat_dev).float()
+                res_mean = st["res_mean"].to(stat_dev).float()
+                res_M2   = st["res_M2"].to(stat_dev).float()
+                sq_err_sum = st["sq_err_sum"].to(stat_dev).float()
+                per_dim_mse_sum = st["per_dim_mse_sum"].to(stat_dev).float()
                 print(f"  [resume] Reconstruction: {len(completed)}/{len(shard_paths)} shards already done.")
         else:
             completed = set()
@@ -466,19 +472,19 @@ def calculate_reconstruction_metrics(
 
                 if d_model is None:
                     d_model      = batch.shape[1]
-                    x_mean       = torch.zeros(d_model)
-                    x_M2         = torch.zeros(d_model)
-                    res_mean     = torch.zeros(d_model)
-                    res_M2       = torch.zeros(d_model)
-                    per_dim_mse_sum = torch.zeros(d_model)
+                    x_mean       = torch.zeros(d_model, device=stat_dev)
+                    x_M2         = torch.zeros(d_model, device=stat_dev)
+                    res_mean     = torch.zeros(d_model, device=stat_dev)
+                    res_M2       = torch.zeros(d_model, device=stat_dev)
+                    per_dim_mse_sum = torch.zeros(d_model, device=stat_dev)
 
                 # Accumulate MSE
-                sq_err_sum      += (residual ** 2).sum().cpu()
-                per_dim_mse_sum += (residual ** 2).sum(dim=0).cpu()
+                sq_err_sum      += (residual ** 2).sum()
+                per_dim_mse_sum += (residual ** 2).sum(dim=0)
 
-                # Accumulate variance statistics (on CPU)
-                n_total, x_mean, x_M2     = _update_welford(n_total, x_mean, x_M2,     batch.cpu())
-                _,       res_mean, res_M2 = _update_welford(n_total - b, res_mean, res_M2, residual.cpu())
+                # Accumulate variance statistics (same device as batch / stat_dev)
+                n_total, x_mean, x_M2     = _update_welford(n_total, x_mean, x_M2,     batch)
+                _,       res_mean, res_M2 = _update_welford(n_total - b, res_mean, res_M2, residual)
 
             completed.add(key)
             if resume and resume_path is not None and split_fp is not None and d_model is not None:
@@ -547,9 +553,10 @@ def calculate_sparsity_metrics(
     Returns:
         dict with L0, dead features, highly active features, etc., and n_tokens.
     """
+    stat_dev = _metrics_accumulator_device(device)
     n_total         = 0
-    l0_sum          = 0.0
-    feature_act_sum = None   # [dict_size] — accumulated on CPU
+    l0_sum_t        = torch.tensor(0.0, device=stat_dev)
+    feature_act_sum = None   # [dict_size]
 
     completed: Set[str] = set()
     if (
@@ -564,8 +571,12 @@ def calculate_sparsity_metrics(
             st = blob.get("state", {})
             if st and int(st.get("n_total", 0)) > 0:
                 n_total = int(st["n_total"])
-                l0_sum  = float(st["l0_sum"])
-                feature_act_sum = st["feature_act_sum"].cpu().float()
+                lv = st["l0_sum"]
+                if isinstance(lv, torch.Tensor):
+                    l0_sum_t = lv.to(stat_dev).float()
+                else:
+                    l0_sum_t = torch.tensor(float(lv), device=stat_dev)
+                feature_act_sum = st["feature_act_sum"].to(stat_dev).float()
                 print(f"  [resume] Sparsity: {len(completed)}/{len(shard_paths)} shards already done.")
         else:
             completed = set()
@@ -584,10 +595,10 @@ def calculate_sparsity_metrics(
                 active   = (acts != 0)     # [b, dict_size] bool
 
                 if feature_act_sum is None:
-                    feature_act_sum = torch.zeros(acts.shape[1])
+                    feature_act_sum = torch.zeros(acts.shape[1], device=stat_dev)
 
-                l0_sum          += active.float().sum(dim=-1).sum().item()
-                feature_act_sum += active.float().sum(dim=0).cpu()
+                l0_sum_t        += active.float().sum(dim=-1).sum()
+                feature_act_sum += active.float().sum(dim=0)
                 n_total         += batch.shape[0]
 
             completed.add(key)
@@ -604,7 +615,7 @@ def calculate_sparsity_metrics(
                         "completed_shards": sorted(completed),
                         "state": {
                             "n_total": n_total,
-                            "l0_sum": l0_sum,
+                            "l0_sum": float(l0_sum_t.item()),
                             "feature_act_sum": feature_act_sum.cpu(),
                         },
                     },
@@ -614,7 +625,7 @@ def calculate_sparsity_metrics(
         raise RuntimeError("No tokens were processed — check shard_paths.")
 
     feature_active = feature_act_sum / n_total   # activation frequency per feature
-    l0_sparsity    = l0_sum / n_total
+    l0_sparsity    = (l0_sum_t / n_total).item()
     dead_features  = (feature_active == 0).sum().item()
     highly_active  = (feature_active > 0.5).sum().item()
 
