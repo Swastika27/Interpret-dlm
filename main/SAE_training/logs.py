@@ -1,9 +1,14 @@
 # import wandb
-import torch
-from functools import partial
-import os
 import json
+import os
+import random
+import shutil
+from functools import partial
 from pathlib import Path
+from typing import Any, Dict, Optional
+
+import numpy as np
+import torch
 
 def init_wandb(cfg):
     return wandb.init(project=cfg["wandb_project"], name=cfg["name"], config=cfg, reinit=True)
@@ -104,21 +109,139 @@ def save_checkpoint(wandb_run, sae, cfg, step):
     print(f"Model and config saved as artifact at step {step}")
 
 
+def _cfg_json_safe(cfg: dict) -> dict:
+    out: Dict[str, Any] = {}
+    for key, value in cfg.items():
+        if isinstance(value, (int, float, str, bool)) or value is None:
+            out[key] = value
+        elif isinstance(value, torch.dtype):
+            out[key] = str(value)
+        elif isinstance(value, torch.device):
+            out[key] = str(value)
+        else:
+            out[key] = str(value)
+    return out
+
+
+def _update_latest_pointer(save_dir: str, target_abs_path: str, link_name: str) -> None:
+    """Point link_name in save_dir at target_abs_path (symlink, or copy on Windows)."""
+    latest_path = os.path.join(save_dir, link_name)
+    rel = os.path.relpath(os.path.abspath(target_abs_path), start=os.path.abspath(save_dir))
+    try:
+        if os.path.lexists(latest_path) or os.path.isfile(latest_path):
+            try:
+                os.unlink(latest_path)
+            except OSError:
+                pass
+        os.symlink(rel, latest_path, target_is_directory=False)
+    except OSError:
+        shutil.copy2(target_abs_path, latest_path)
+
+
 def save_checkpoint(sae, cfg, theta, step):
     save_dir = f"{cfg['run_dir']}/checkpoints"
     os.makedirs(save_dir, exist_ok=True)
 
     # Save model state
     sae_path = os.path.join(save_dir, f"step_{step}.pt")
-    payload = {"state_dict": sae.state_dict()}
+    payload = {"state_dict": sae.state_dict(), "cfg": _cfg_json_safe(cfg)}
     if theta is not None:
         payload["theta"] = theta
     torch.save(payload, sae_path)
 
-    latest_path = os.path.join(save_dir, "latest.pt")
-    target_path = os.path.relpath(sae_path, start=save_dir)
+    _update_latest_pointer(save_dir, sae_path, "latest.pt")
 
-    if os.path.lexists(latest_path):
-        os.unlink(latest_path)
 
-    os.symlink(target_path, latest_path)
+def save_training_checkpoint(
+    sae,
+    optimizer: torch.optim.Optimizer,
+    cfg: dict,
+    theta: Optional[float],
+    global_step: int,
+    gated_state: Dict[str, Any],
+    activation_store,
+) -> str:
+    """
+    Full training state for resume: model, optimizer, RNG, gated warm-up, data iterator.
+
+    global_step: number of completed optimizer steps (next loop index).
+    Writes training_step_{global_step}.pt and updates latest_training.pt.
+    """
+    save_dir = f"{cfg['run_dir']}/checkpoints"
+    os.makedirs(save_dir, exist_ok=True)
+    path = os.path.join(save_dir, f"training_step_{global_step}.pt")
+
+    rng: Dict[str, Any] = {
+        "torch": torch.get_rng_state(),
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+    }
+    if torch.cuda.is_available():
+        rng["cuda"] = torch.cuda.get_rng_state_all()
+    else:
+        rng["cuda"] = None
+
+    payload = {
+        "format_version": 1,
+        "global_step": int(global_step),
+        "state_dict": sae.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "theta": theta,
+        "gated_state": dict(gated_state),
+        "cfg_snapshot": _cfg_json_safe(cfg),
+        "rng": rng,
+        "activation_store": activation_store.state_dict(),
+    }
+    torch.save(payload, path)
+    _update_latest_pointer(save_dir, path, "latest_training.pt")
+    print(f"  [checkpoint] Saved full training state: {path}")
+    return path
+
+
+def resolve_training_checkpoint_path(raw: str) -> str:
+    """File path, or directory containing latest_training.pt."""
+    p = Path(raw)
+    if p.is_file():
+        return str(p.resolve())
+    if p.is_dir():
+        cand = p / "latest_training.pt"
+        if cand.is_file():
+            return str(cand.resolve())
+    raise FileNotFoundError(
+        f"Training checkpoint not found: {raw} "
+        "(expected a .pt file or a directory with latest_training.pt)"
+    )
+
+
+def load_training_checkpoint(
+    path: str,
+    sae: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    activation_store,
+) -> Dict[str, Any]:
+    map_dev = next(sae.parameters()).device
+    payload = torch.load(path, map_location=map_dev)
+
+    if payload.get("format_version") != 1:
+        raise ValueError(f"Unsupported checkpoint format: {payload.get('format_version')}")
+
+    sae.load_state_dict(payload["state_dict"])
+    optimizer.load_state_dict(payload["optimizer"])
+    activation_store.load_state_dict(payload["activation_store"])
+
+    rng = payload.get("rng") or {}
+    if "torch" in rng:
+        torch.set_rng_state(rng["torch"])
+    if rng.get("cuda") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(rng["cuda"])
+    if "python" in rng:
+        random.setstate(rng["python"])
+    if "numpy" in rng:
+        np.random.set_state(rng["numpy"])
+
+    return {
+        "global_step": int(payload["global_step"]),
+        "gated_state": payload.get("gated_state") or {},
+        "theta": payload.get("theta"),
+        "cfg_snapshot": payload.get("cfg_snapshot"),
+    }

@@ -1,6 +1,14 @@
 import torch
 import tqdm
-from logs import init_wandb, log_wandb, log_model_performance, save_checkpoint
+from logs import (
+    init_wandb,
+    log_wandb,
+    log_model_performance,
+    save_checkpoint,
+    save_training_checkpoint,
+    load_training_checkpoint,
+    resolve_training_checkpoint_path,
+)
 import os
 import csv
 from typing import Dict, List, Optional, Any
@@ -33,15 +41,33 @@ def _theta_for_checkpoint(sae, cfg) -> Optional[float]:
 
 def train_sae_wo_model(sae, activation_store, cfg):
     num_batches = cfg["num_tokens"] // cfg["batch_size"]
+    if num_batches <= 0:
+        raise ValueError("num_tokens must be >= batch_size (got num_batches == 0)")
     base_lr = float(cfg["lr"])
     cfg["base_lr"] = base_lr
     optimizer = torch.optim.Adam(
         sae.parameters(), lr=base_lr, betas=(cfg["beta1"], cfg["beta2"])
     )
-    pbar = tqdm.trange(num_batches)
 
     gated_state: Dict[str, Any] = {"in_warmup": False, "warmup_step": 0}
     is_gated = cfg.get("sae_type", "").lower() == "gated"
+
+    start_step = 0
+    resume_src = cfg.get("resume_path") or cfg.get("resume")
+    if resume_src:
+        ckpt_path = resolve_training_checkpoint_path(resume_src)
+        loaded = load_training_checkpoint(ckpt_path, sae, optimizer, activation_store)
+        start_step = loaded["global_step"]
+        gated_state.update(loaded.get("gated_state") or {})
+        if loaded.get("theta") is not None:
+            cfg["theta"] = loaded["theta"]
+        print(f"[resume] Loaded {ckpt_path} — continuing from global_step={start_step} / {num_batches}")
+
+    if start_step >= num_batches:
+        print(f"[resume] global_step {start_step} >= num_batches {num_batches}; nothing to train.")
+        return
+
+    pbar = tqdm.trange(start_step, num_batches, initial=start_step, total=num_batches)
 
     # wandb_run = init_wandb(cfg)
     os.makedirs(cfg["run_dir"], exist_ok=True)
@@ -58,7 +84,8 @@ def train_sae_wo_model(sae, activation_store, cfg):
         "aux_loss",
         "num_dead_features",
     ]
-    
+
+    last_completed = start_step
     for i in pbar:
         batch = activation_store.next_batch()
         if is_gated:
@@ -67,23 +94,18 @@ def train_sae_wo_model(sae, activation_store, cfg):
         sae_output = sae(batch)
         loss = sae_output["loss"]
         # log_wandb(sae_output, i, wandb_run)
-        if (i+1) % cfg["perf_log_freq"]  == 0:
-            row = {"step": i+1, 
-                   "total_loss": f"{loss.item()}", 
-                   "l0_norm": f"{sae_output['l0_norm']}", 
-                   "l2_loss": f"{sae_output['l2_loss']}", 
-                   "l1_loss": f"{sae_output['l1_loss']}", 
+        if (i + 1) % cfg["perf_log_freq"] == 0:
+            row = {"step": i + 1,
+                   "total_loss": f"{loss.item()}",
+                   "l0_norm": f"{sae_output['l0_norm']}",
+                   "l2_loss": f"{sae_output['l2_loss']}",
+                   "l1_loss": f"{sae_output['l1_loss']}",
                    "l1_norm": f"{sae_output['l1_norm']}",
                    "aux_loss": f"{sae_output['aux_loss']}",
                    "num_dead_features": f"{sae_output['num_dead_features']}",
-                }
+                   }
             write_csv_row(log_path, header, row)
 
-        if (i+1) % cfg["checkpoint_freq"] == 0:
-            theta = _theta_for_checkpoint(sae, cfg)
-            save_checkpoint(sae, cfg, theta, i+1)
-
-        
         pbar.set_postfix({"Loss": f"{loss.item():.4f}", "L0": f"{sae_output['l0_norm']:.4f}", "L2": f"{sae_output['l2_loss']:.4f}", "L1": f"{sae_output['l1_loss']:.4f}", "L1_norm": f"{sae_output['l1_norm']:.4f}"})
         loss.backward()
         torch.nn.utils.clip_grad_norm_(sae.parameters(), cfg["max_grad_norm"])
@@ -111,8 +133,20 @@ def train_sae_wo_model(sae, activation_store, cfg):
                     gated_state["in_warmup"] = False
                     gated_state["warmup_step"] = 0
 
+        if (i + 1) % cfg["checkpoint_freq"] == 0:
+            theta = _theta_for_checkpoint(sae, cfg)
+            save_checkpoint(sae, cfg, theta, i + 1)
+            save_training_checkpoint(
+                sae, optimizer, cfg, theta, i + 1, gated_state, activation_store
+            )
+
+        last_completed = i + 1
+
     theta = _theta_for_checkpoint(sae, cfg)
-    save_checkpoint(sae, cfg, theta, i+1)
+    save_checkpoint(sae, cfg, theta, last_completed)
+    save_training_checkpoint(
+        sae, optimizer, cfg, theta, last_completed, gated_state, activation_store
+    )
 
 
 def train_sae(sae, activation_store, model, cfg):

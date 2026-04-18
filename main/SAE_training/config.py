@@ -35,6 +35,8 @@ def get_default_cfg():
 
         "perf_log_freq": 10,
         "checkpoint_freq": 500,
+        # Optional: path to training_step_*.pt or checkpoints/ (see main.py --resume)
+        "resume_path": None,
 
         "n_batches_to_dead": 5,
 

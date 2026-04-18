@@ -1,7 +1,8 @@
-import torch
-from torch.utils.data import TensorDataset, DataLoader
 import glob
 import random
+from typing import Any, Dict
+
+import torch
 
 class StreamingActivationsStore:
     def __init__(self, cfg):
@@ -16,6 +17,36 @@ class StreamingActivationsStore:
         self.act_size = cfg["act_size"]
 
         self._start_new_epoch()
+
+    def state_dict(self) -> Dict[str, Any]:
+        """
+        Snapshot iterator state for resume. Persists the in-memory shard tensor
+        (CPU) so mid-shard resume stays consistent with the same row order.
+        """
+        state: Dict[str, Any] = {
+            "shard_order": list(self.shard_order),
+            "current_shard_idx": int(self.current_shard_idx),
+            "current_pos": int(self.current_pos),
+            "python_random": random.getstate(),
+        }
+        if self.current_shard_tensor is not None:
+            state["current_shard_tensor"] = self.current_shard_tensor.detach().cpu().clone()
+        else:
+            state["current_shard_tensor"] = None
+        return state
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        self.shard_order = list(state["shard_order"])
+        self.current_shard_idx = int(state["current_shard_idx"])
+        self.current_pos = int(state["current_pos"])
+        random.setstate(state["python_random"])
+        t = state.get("current_shard_tensor")
+        if t is not None:
+            self.current_shard_tensor = t.contiguous()
+            if self.device.type == "cuda":
+                self.current_shard_tensor = self.current_shard_tensor.pin_memory()
+        else:
+            self.current_shard_tensor = None
 
     def _start_new_epoch(self):
         # Shuffle shards at the start of each epoch

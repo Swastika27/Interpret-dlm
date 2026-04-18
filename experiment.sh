@@ -53,13 +53,26 @@ model_basename=$model_basename_gated
 #     --checkpoint_freq $checkpoint_freq \
       # --name $model_basename
 
-# Gated SAE training example (uncomment to run instead of SAE_training; comment out the block above):
-final_checkpoint_file="trained_models/$model_basename/checkpoints/step_${num_batches_total}.pt"
-if [ -f $final_checkpoint_file ]; then
-echo "Final checkpoint already exists. Skipping training..."
+# SAE checkpoints live under trained_models/<name>/checkpoints/
+#   - step_<N>.pt              — weights (+ cfg snapshot) for eval / downstream
+#   - training_step_<N>.pt     — full training state; latest_training.pt → resume
+CHECKPOINT_DIR="trained_models/${model_basename}/checkpoints"
+FINAL_MODEL_CKPT="${CHECKPOINT_DIR}/step_${num_batches_total}.pt"
+# Optional: set SAE_RESUME to a .pt file or this directory to force --resume (overrides auto)
+TRAIN_EXTRA=()
+if [ -n "${SAE_RESUME:-}" ]; then
+  TRAIN_EXTRA+=(--resume "${SAE_RESUME}")
+elif [ ! -f "$FINAL_MODEL_CKPT" ] && [ -f "${CHECKPOINT_DIR}/latest_training.pt" ]; then
+  echo "Found ${CHECKPOINT_DIR}/latest_training.pt — resuming SAE training (--resume ${CHECKPOINT_DIR})."
+  TRAIN_EXTRA+=(--resume "${CHECKPOINT_DIR}")
+fi
+
+# Gated SAE training example (uncomment BatchTopK block above to switch)
+if [ -f "$FINAL_MODEL_CKPT" ]; then
+  echo "Final model checkpoint already exists (${FINAL_MODEL_CKPT}). Skipping training..."
 else
-echo "Did not find        $final_checkpoint_file , trainingggggggg..."
-python main/SAE_training/main.py \
+  echo "Training SAE (target final step: ${num_batches_total}) → ${FINAL_MODEL_CKPT}"
+  python main/SAE_training/main.py \
     --sae_type gated \
     --layer $layer \
     --num_tokens $num_train_tokens \
@@ -69,9 +82,9 @@ python main/SAE_training/main.py \
     --gated_aux_coeff $gated_aux_coeff \
     --perf_log_freq $perf_log_freq \
     --checkpoint_freq $checkpoint_freq \
-    --name $model_basename \
-    # --embedding_glob test_shards/*.pt
-  fi
+    --name "$model_basename" \
+    "${TRAIN_EXTRA[@]}"
+fi
 
 
 # Plot training metrics
@@ -119,7 +132,7 @@ done
 readarray -t EPOCH_CKPTS < <(printf '%s\n' "${CK_STEPS[@]}" | sort -nu)
 
 for ckpt_step in "${EPOCH_CKPTS[@]}"; do
-  sae_ckpt="trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt"
+  sae_ckpt="${CHECKPOINT_DIR}/step_${ckpt_step}.pt"
   if [ ! -f "$sae_ckpt" ]; then
     echo "Skipping step ${ckpt_step}: checkpoint not found at $sae_ckpt"
     continue
@@ -139,7 +152,7 @@ for ckpt_step in "${EPOCH_CKPTS[@]}"; do
   $CONTAINER_NAME bash -c "
     cd $docker_wdr && \
     python main/evaluate_sae.py \
-      --sae_path trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt \
+      --sae_path ${CHECKPOINT_DIR}/step_${ckpt_step}.pt \
       --cfg_path trained_models/$model_basename/config.json \
       --val_embeddings_path $docker_base/$disk2_embed_dir/val/layer_${layer} \
       --test_embeddings_path $docker_base/$disk2_embed_dir/test/layer_${layer} \
@@ -207,7 +220,7 @@ PY
   else
     python main/sae_epoch_diagnostics.py \
       --sae_cfg trained_models/$model_basename/config.json \
-      --checkpoints_glob trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt \
+      --checkpoints_glob ${CHECKPOINT_DIR}/step_${ckpt_step}.pt \
       --save_dir $disk2_embed_dir \
       --layer $layer \
       --splits val test \
@@ -222,7 +235,7 @@ PY
   fi
 
   # python main/find_top_activations.py \
-  #   --sae_checkpoint  trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt \
+  #   --sae_checkpoint  ${CHECKPOINT_DIR}/step_${ckpt_step}.pt \
   #   --sae_cfg         trained_models/$model_basename/config.json \
   #   --embed_dir       $disk2_embed_dir \
   #   --layer           $layer \
@@ -246,7 +259,7 @@ PY
   echo "output file already exists. Skipping..."
   else
   python main/concept_feature_analysis.py \
-    --sae_checkpoint  trained_models/$model_basename/checkpoints/step_${ckpt_step}.pt \
+    --sae_checkpoint  ${CHECKPOINT_DIR}/step_${ckpt_step}.pt \
     --sae_cfg         trained_models/$model_basename/config.json \
     --save_dir        $disk2_embed_dir \
     --layer           $layer \
