@@ -628,6 +628,7 @@ def calculate_sparsity_metrics(
     l0_sparsity    = (l0_sum_t / n_total).item()
     dead_features  = (feature_active == 0).sum().item()
     highly_active  = (feature_active > 0.5).sum().item()
+    highly_active_indices = torch.where(feature_active > 0.5)[0].cpu().tolist()
 
     return {
         "l0_sparsity": l0_sparsity,
@@ -637,6 +638,8 @@ def calculate_sparsity_metrics(
         "highly_active_features": int(highly_active),
         "highly_active_pct": (highly_active / sae.dict_size) * 100,
         "mean_feature_activation_freq": feature_active.mean().item() * 100,
+        # For concept_feature_analysis --exclude_feature_indices_json (freq > 0.5, same as highly_active_* count)
+        "highly_active_feature_indices": [int(i) for i in highly_active_indices],
         "n_tokens": int(n_total),
     }
 
@@ -1057,7 +1060,29 @@ def evaluate_sae(
         )
         sparsity_metrics.pop("n_tokens", None)
         results[split_name]["sparsity"] = sparsity_metrics
+
+        if output_file is not None:
+            hi = sparsity_metrics.get("highly_active_feature_indices")
+            if hi is not None:
+                sidecar = Path(output_file).parent / f"{split_name}_highly_active_features.json"
+                sidecar.parent.mkdir(parents=True, exist_ok=True)
+                with open(sidecar, "w", encoding="utf-8") as jf:
+                    json.dump(
+                        {
+                            "source": "evaluate_sae.calculate_sparsity_metrics",
+                            "activation_freq_threshold": 0.5,
+                            "indices": hi,
+                        },
+                        jf,
+                        indent=2,
+                    )
+                print(f"  Wrote highly-active index list: {sidecar}")
+
         for k, v in sparsity_metrics.items():
+            if k == "highly_active_feature_indices":
+                n = len(v) if isinstance(v, list) else 0
+                print(f"  {k}: {n} feature(s) (list also in YAML and sidecar JSON)")
+                continue
             fmt = f"{v:.2f}%" if ("pct" in k or "freq" in k) else str(v)
             print(f"  {k}: {fmt}")
 

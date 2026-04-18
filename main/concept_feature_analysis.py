@@ -33,6 +33,11 @@ Output layout:
             all_features.csv     – full stats for every feature
         summary.csv              – best feature per concept across all concepts
 
+    Optional second tree (--out_dir_excluding_dense + --exclude_feature_indices_json):
+        Same layout, but rankings exclude dense/highly-active features (union of index
+        lists from e.g. evaluate_sae test_highly_active_features.json and
+        sae_epoch_diagnostics summary.json dense_features_union).
+
 Memory model
 ------------
 The original script accumulated all shard activations (float32) in RAM before
@@ -400,9 +405,47 @@ def accumulate_shard(
 # Metrics from streaming counts
 # ---------------------------------------------------------------------------
 
+def load_excluded_feature_indices_json(paths: List[str]) -> Set[int]:
+    """
+    Union feature indices from one or more JSON files.
+
+    Accepts:
+      - A bare JSON list of ints: [0, 1, 2]
+      - Dicts with any of: excluded_indices, excluded_feature_indices,
+        highly_active_feature_indices, dense_features_union, dense_features_top_n,
+        dense_features_over_threshold, indices (evaluate_sae sidecar)
+    """
+    out: Set[int] = set()
+    keys = (
+        "excluded_indices",
+        "excluded_feature_indices",
+        "highly_active_feature_indices",
+        "dense_features_union",
+        "dense_features_top_n",
+        "dense_features_over_threshold",
+        "indices",
+    )
+    for path in paths:
+        if not path or not os.path.isfile(path):
+            raise FileNotFoundError(f"exclude JSON not found: {path}")
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, list):
+            out.update(int(x) for x in data)
+            continue
+        if isinstance(data, dict):
+            for k in keys:
+                if k in data and data[k] is not None:
+                    seq = data[k]
+                    if isinstance(seq, list):
+                        out.update(int(x) for x in seq)
+    return out
+
+
 def compute_metrics_from_counts(
     counts: dict,
     top_k_features: int,
+    exclude_feature_indices: Optional[Set[int]] = None,
 ) -> List[List[dict]]:
     """
     Derive per-concept F1 and confusion matrix from the accumulated integer
@@ -456,6 +499,11 @@ def compute_metrics_from_counts(
         baseline_prevalence = pos_acts / n_pos
 
         order = np.argsort(f1)[::-1]
+        if exclude_feature_indices:
+            order = np.array(
+                [fi for fi in order if int(fi) not in exclude_feature_indices],
+                dtype=np.int64,
+            )
         rows  = []
         for fi in order:
             fi = int(fi)
@@ -539,9 +587,29 @@ def parse_args():
         help="Analyse raw model neurons (embedding dims) instead of SAE features; "
              "uses ReLU so binarisation acts > 0 matches SAE convention.",
     )
+    p.add_argument(
+        "--exclude_feature_indices_json",
+        nargs="*",
+        default=[],
+        metavar="PATH",
+        help="Optional JSON file(s) whose feature indices are merged (union) and "
+             "omitted from rankings when writing --out_dir_excluding_dense. "
+             "Use sidecars from evaluate_sae (*_highly_active_features.json) and/or "
+             "sae_epoch_diagnostics summary.json (dense_features_union).",
+    )
+    p.add_argument(
+        "--out_dir_excluding_dense",
+        default=None,
+        help="If set with --exclude_feature_indices_json, write a second result tree "
+             "here with dense/highly-active features excluded from F1 rankings.",
+    )
     args = p.parse_args()
     if not args.raw_neurons and not args.sae_checkpoint:
         p.error("--sae_checkpoint is required unless --raw_neurons is set")
+    if args.out_dir_excluding_dense and not args.exclude_feature_indices_json:
+        p.error("--out_dir_excluding_dense requires at least one --exclude_feature_indices_json")
+    if args.exclude_feature_indices_json and not args.out_dir_excluding_dense:
+        p.error("--exclude_feature_indices_json requires --out_dir_excluding_dense")
     return args
 
 
@@ -739,6 +807,20 @@ def _cofa_read_summary_row_from_top_csv(concept_dir: str) -> Optional[dict]:
 
 def main():
     args = parse_args()
+    exclude_set = (
+        load_excluded_feature_indices_json(list(args.exclude_feature_indices_json))
+        if args.exclude_feature_indices_json
+        else set()
+    )
+    if args.out_dir_excluding_dense:
+        if len(exclude_set) == 0:
+            raise ValueError(
+                "Merged exclusion set is empty. Populate JSON from evaluate_sae "
+                "(*_highly_active_features.json), sae_epoch_diagnostics (dense_features_union), "
+                "or a manual list."
+            )
+        print(f"\nExcluding {len(exclude_set)} feature index(es) from secondary output "
+              f"({args.out_dir_excluding_dense}).")
 
     # ---- Load config (SAE loaded only when shards still need work) ---
     with open(args.sae_cfg) as fh:
@@ -794,11 +876,17 @@ def main():
                 done_keys = set(meta.get("completed_shard_keys", [])) & set(expected_keys)
                 print(f"[resume] Loaded partial state: {len(done_keys)}/{len(expected_keys)} shards done.")
 
+    bed_names = [b.name for b in bed_indices]
+    second_needed = bool(args.out_dir_excluding_dense and exclude_set)
     if (
         args.resume
         and expected_keys
         and len(done_keys) >= len(expected_keys)
-        and _cofa_concept_outputs_exist(args.out_dir, [b.name for b in bed_indices])
+        and _cofa_concept_outputs_exist(args.out_dir, bed_names)
+        and (
+            not second_needed
+            or _cofa_concept_outputs_exist(args.out_dir_excluding_dense, bed_names)
+        )
     ):
         print("[resume] All shards and concept outputs already present — exiting.")
         return
@@ -868,85 +956,121 @@ def main():
     # ---- Compute metrics from accumulated counts ---------------------
     print("\nComputing metrics ...")
     all_concept_rows = compute_metrics_from_counts(counts, args.top_k_features)
+    excl_concept_rows: Optional[List[List[dict]]] = None
+    if second_needed:
+        excl_concept_rows = compute_metrics_from_counts(
+            counts, args.top_k_features, exclude_feature_indices=exclude_set
+        )
+
+    def _write_results_tree(
+        out_root: str,
+        concept_rows: List[List[dict]],
+        summary_label: str,
+    ) -> None:
+        os.makedirs(out_root, exist_ok=True)
+        os.chmod(out_root, 0o777)
+        local_summary: List[dict] = []
+
+        for ci, bed in enumerate(bed_indices):
+            rows = concept_rows[ci]
+            if not rows:
+                n_pos_c = int(counts["n_pos"][ci])
+                reason = (
+                    "no positive tokens"
+                    if n_pos_c == 0
+                    else "no features left after exclusion (all indices filtered)"
+                )
+                print(f"\n  [WARNING] Skipping '{bed.name}' ({summary_label}) — {reason}.")
+                continue
+
+            concept_dir = os.path.join(out_root, bed.name)
+            all_csv = os.path.join(concept_dir, "all_features.csv")
+            top_csv = os.path.join(concept_dir, "top_features.csv")
+            if args.resume and os.path.isfile(all_csv) and os.path.isfile(top_csv):
+                print(f"\n  [resume] Skipping '{bed.name}' ({summary_label}) — CSV outputs already exist.")
+                prev = _cofa_read_summary_row_from_top_csv(concept_dir)
+                if prev:
+                    local_summary.append(prev)
+                continue
+
+            print(f"\n  Top {args.top_k_features} features for '{bed.name}' ({summary_label}):")
+            print(f"  {'feat':>6}  {'F1':>6}  {'Prec':>6}  {'Rec/TPR':>8}  "
+                  f"{'TNR':>6}  {'FPR':>6}  {'FNR':>6}  "
+                  f"{'TP':>6}  {'TN':>6}  {'FP':>6}  {'FN':>6}  "
+                  f"{'BasePrevalence':>14}")
+            print("  " + "-" * 105)
+            top_rows = rows[:args.top_k_features]
+            for r in top_rows:
+                print(
+                    f"  {r['feature_idx']:>6}  {r['f1']:>6.3f}  {r['precision']:>6.3f}  "
+                    f"{r['recall_tpr']:>8.3f}  {r['tnr']:>6.3f}  {r['fpr']:>6.3f}  "
+                    f"{r['fnr']:>6.3f}  {r['tp']:>6}  {r['tn']:>6}  "
+                    f"{r['fp']:>6}  {r['fn']:>6}  {r['baseline_prevalence']:>14.4f}"
+                )
+
+            os.makedirs(concept_dir, exist_ok=True)
+            os.chmod(concept_dir, 0o777)
+            write_feature_csv(os.path.join(concept_dir, "all_features.csv"), rows)
+            write_feature_csv(os.path.join(concept_dir, "top_features.csv"), top_rows)
+
+            best = top_rows[0]
+            local_summary.append({
+                "concept":             bed.name,
+                "best_feature_idx":    best["feature_idx"],
+                "f1":                  best["f1"],
+                "precision":           best["precision"],
+                "recall_tpr":          best["recall_tpr"],
+                "tnr":                 best["tnr"],
+                "fpr":                 best["fpr"],
+                "fnr":                 best["fnr"],
+                "tp":                  best["tp"],
+                "tn":                  best["tn"],
+                "fp":                  best["fp"],
+                "fn":                  best["fn"],
+                "n_positive_tokens":   best["n_positive_tokens"],
+                "baseline_prevalence": best["baseline_prevalence"],
+            })
+
+        summary_path = os.path.join(out_root, "summary.csv")
+        summary_header = [
+            "concept", "best_feature_idx", "f1", "precision", "recall_tpr",
+            "tnr", "fpr", "fnr", "tp", "tn", "fp", "fn",
+            "n_positive_tokens", "baseline_prevalence",
+        ]
+        with open(summary_path, "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=summary_header)
+            w.writeheader()
+            for row in local_summary:
+                w.writerow({
+                    k: f"{row[k]:.6f}" if isinstance(row[k], float) else row[k]
+                    for k in summary_header
+                })
 
     # ---- Write results -----------------------------------------------
-    os.makedirs(args.out_dir, exist_ok=True)
-    os.chmod(args.out_dir, 0o777)
-    summary_rows = []
-
-    for ci, bed in enumerate(bed_indices):
-        rows = all_concept_rows[ci]
-        if not rows:
-            print(f"\n  [WARNING] No positive tokens for '{bed.name}', skipping.")
-            continue
-
-        concept_dir = os.path.join(args.out_dir, bed.name)
-        all_csv = os.path.join(concept_dir, "all_features.csv")
-        top_csv = os.path.join(concept_dir, "top_features.csv")
-        if args.resume and os.path.isfile(all_csv) and os.path.isfile(top_csv):
-            print(f"\n  [resume] Skipping '{bed.name}' — CSV outputs already exist.")
-            prev = _cofa_read_summary_row_from_top_csv(concept_dir)
-            if prev:
-                summary_rows.append(prev)
-            continue
-
-        print(f"\n  Top {args.top_k_features} features for '{bed.name}':")
-        print(f"  {'feat':>6}  {'F1':>6}  {'Prec':>6}  {'Rec/TPR':>8}  "
-              f"{'TNR':>6}  {'FPR':>6}  {'FNR':>6}  "
-              f"{'TP':>6}  {'TN':>6}  {'FP':>6}  {'FN':>6}  "
-              f"{'BasePrevalence':>14}")
-        print("  " + "-" * 105)
-        top_rows = rows[:args.top_k_features]
-        for r in top_rows:
-            print(
-                f"  {r['feature_idx']:>6}  {r['f1']:>6.3f}  {r['precision']:>6.3f}  "
-                f"{r['recall_tpr']:>8.3f}  {r['tnr']:>6.3f}  {r['fpr']:>6.3f}  "
-                f"{r['fnr']:>6.3f}  {r['tp']:>6}  {r['tn']:>6}  "
-                f"{r['fp']:>6}  {r['fn']:>6}  {r['baseline_prevalence']:>14.4f}"
+    _write_results_tree(args.out_dir, all_concept_rows, "all features")
+    if second_needed and excl_concept_rows is not None and args.out_dir_excluding_dense:
+        os.makedirs(args.out_dir_excluding_dense, exist_ok=True)
+        with open(
+            os.path.join(args.out_dir_excluding_dense, "excluded_feature_indices.json"),
+            "w",
+            encoding="utf-8",
+        ) as fh:
+            json.dump(
+                {
+                    "excluded_indices": sorted(exclude_set),
+                    "source_json_files": list(args.exclude_feature_indices_json),
+                },
+                fh,
+                indent=2,
             )
-
-        os.makedirs(concept_dir, exist_ok=True)
-        os.chmod(concept_dir, 0o777)
-        write_feature_csv(os.path.join(concept_dir, "all_features.csv"), rows)
-        write_feature_csv(os.path.join(concept_dir, "top_features.csv"), top_rows)
-
-        best = top_rows[0]
-        summary_rows.append({
-            "concept":             bed.name,
-            "best_feature_idx":    best["feature_idx"],
-            "f1":                  best["f1"],
-            "precision":           best["precision"],
-            "recall_tpr":          best["recall_tpr"],
-            "tnr":                 best["tnr"],
-            "fpr":                 best["fpr"],
-            "fnr":                 best["fnr"],
-            "tp":                  best["tp"],
-            "tn":                  best["tn"],
-            "fp":                  best["fp"],
-            "fn":                  best["fn"],
-            "n_positive_tokens":   best["n_positive_tokens"],
-            "baseline_prevalence": best["baseline_prevalence"],
-        })
-
-    summary_path   = os.path.join(args.out_dir, "summary.csv")
-    summary_header = [
-        "concept", "best_feature_idx", "f1", "precision", "recall_tpr",
-        "tnr", "fpr", "fnr", "tp", "tn", "fp", "fn",
-        "n_positive_tokens", "baseline_prevalence",
-    ]
-    with open(summary_path, "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=summary_header)
-        w.writeheader()
-        for row in summary_rows:
-            w.writerow({
-                k: f"{row[k]:.6f}" if isinstance(row[k], float) else row[k]
-                for k in summary_header
-            })
+        _write_results_tree(args.out_dir_excluding_dense, excl_concept_rows, "excluding dense list")
 
     if args.resume:
         _cofa_clear_resume(args.out_dir)
 
     print(f"\nDone. Results saved to {args.out_dir}/")
+    if second_needed and args.out_dir_excluding_dense:
+        print(f"     (excluding dense) also saved to {args.out_dir_excluding_dense}/")
     print(f"  summary.csv                    – best feature per concept")
     print(f"  <concept>/top_features.csv     – top {args.top_k_features} features")
     print(f"  <concept>/all_features.csv     – full ranked feature list")
