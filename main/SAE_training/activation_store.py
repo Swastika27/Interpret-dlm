@@ -12,7 +12,13 @@ _DBG_LOG_PATH = os.path.abspath(
 )
 
 
-def _agent_dbg_log(hypothesis_id: str, location: str, message: str, data: dict) -> None:
+def _agent_dbg_log(
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: dict,
+    run_id: str = "pre-fix",
+) -> None:
     # region agent log
     try:
         with open(_DBG_LOG_PATH, "a", encoding="utf-8") as _f:
@@ -25,7 +31,7 @@ def _agent_dbg_log(hypothesis_id: str, location: str, message: str, data: dict) 
                         "location": location,
                         "message": message,
                         "data": data,
-                        "runId": "pre-fix",
+                        "runId": run_id,
                     }
                 )
                 + "\n"
@@ -37,17 +43,19 @@ def _agent_dbg_log(hypothesis_id: str, location: str, message: str, data: dict) 
 class StreamingActivationsStore:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.device = cfg["device"]
+        self.device = torch.device(cfg["device"])
         # region agent log
         _agent_dbg_log(
             "H1",
             "activation_store.py:StreamingActivationsStore.__init__",
-            "cfg device type and value at store init",
+            "cfg device vs normalized self.device",
             {
-                "device_repr": repr(cfg.get("device")),
-                "device_type_name": type(cfg.get("device")).__name__,
-                "has_type_attr": hasattr(cfg.get("device"), "type"),
+                "cfg_device_repr": repr(cfg.get("device")),
+                "cfg_device_type_name": type(cfg.get("device")).__name__,
+                "self_device_type_name": type(self.device).__name__,
+                "self_device_type_field": getattr(self.device, "type", None),
             },
+            run_id="post-fix",
         )
         # endregion
 
@@ -107,7 +115,9 @@ class StreamingActivationsStore:
             {
                 "self_device_type_name": type(self.device).__name__,
                 "self_device_repr": repr(self.device),
+                "device_type_eq_cuda": self.device.type == "cuda",
             },
+            run_id="post-fix",
         )
         # endregion
         shard_dict = torch.load(shard_path, map_location="cpu")
