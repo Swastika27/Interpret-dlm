@@ -92,7 +92,9 @@ class StreamingActivationsStore:
         random.setstate(state["python_random"])
         t = state.get("current_shard_tensor")
         if t is not None:
-            self.current_shard_tensor = t.contiguous()
+            # Checkpoints store CPU tensors; torch.load(map_location=cuda) may move nested
+            # tensors to GPU — pin_memory requires CPU.
+            self.current_shard_tensor = t.detach().contiguous().cpu()
             if self.device.type == "cuda":
                 self.current_shard_tensor = self.current_shard_tensor.pin_memory()
         else:
