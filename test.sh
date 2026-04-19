@@ -6,17 +6,17 @@ seq_len=512
 seq_per_shard=1024
 layer=6
 
-N_TRAIN=800000
+N_TRAIN=800
 N_VAL=40000
 N_TEST=40000
 
 expansion_factor=16
 top_k=32
-epoch=10
+epoch=1
 lr=0.0003
 batch_size=512
-checkpoint_freq=100000
-perf_log_freq=1000
+checkpoint_freq=100
+perf_log_freq=10
 # For reproducibility
 SEED=42
 
@@ -35,23 +35,14 @@ CONTAINER_NAME="hyena"
 eval "$(conda shell.bash hook)"
 conda activate interpret
 
-# model_basename="layer${layer}_${dict_size}_batchtopk_${top_k}_${lr}"
+model_basename="layer${layer}_${dict_size}_batchtopk_${top_k}_${lr}"
 
-# Gated SAE alternative: set l1_coeff_gated / gated_aux_coeff and use model_basename_gated in eval paths below.
-l1_coeff_gated=0.5
-gated_aux_coeff=1.0
-model_basename_gated="layer${layer}_${dict_size}_gated_l1${l1_coeff_gated}_aux${gated_aux_coeff}_${lr}"
-model_basename=$model_basename_gated
-# # train SAE on training embeddings (BAtchtopk)
-# python main/SAE_training/main.py \
-#     --layer $layer \
-#     --num_tokens $num_train_tokens \
-#     --top_k $top_k \
-#     --dict_size $dict_size \
-#     --batch_size $batch_size \
-#     --perf_log_freq $perf_log_freq \
-#     --checkpoint_freq $checkpoint_freq \
-      # --name $model_basename
+# # Gated SAE alternative: set l1_coeff_gated / gated_aux_coeff and use model_basename_gated in eval paths below.
+# l1_coeff_gated=0.05
+# gated_aux_coeff=1.0
+# model_basename_gated="layer${layer}_${dict_size}_gated_l1${l1_coeff_gated}_aux${gated_aux_coeff}_${lr}"
+# model_basename=$model_basename_gated
+
 
 # SAE checkpoints live under trained_models/<name>/checkpoints/
 #   - step_<N>.pt              — weights (+ cfg snapshot) for eval / downstream
@@ -72,17 +63,31 @@ if [ -f "$FINAL_MODEL_CKPT" ]; then
   echo "Final model checkpoint already exists (${FINAL_MODEL_CKPT}). Skipping training..."
 else
   echo "Training SAE (target final step: ${num_batches_total}) → ${FINAL_MODEL_CKPT}"
-  python main/SAE_training/main.py \
-    --sae_type gated \
+  # python main/SAE_training/main.py \
+  #   --sae_type gated \
+  #   --layer $layer \
+  #   --num_tokens $num_train_tokens \
+  #   --dict_size $dict_size \
+  #   --batch_size $batch_size \
+  #   --l1_coeff $l1_coeff_gated \
+  #   --gated_aux_coeff $gated_aux_coeff \
+  #   --perf_log_freq $perf_log_freq \
+  #   --checkpoint_freq $checkpoint_freq \
+  #   --name "$model_basename" \
+  #   --embedding_glob "test_shards/train/layer_6/*.pt" \
+  #   "${TRAIN_EXTRA[@]}"
+
+     python main/SAE_training/main.py \
+    --sae_type batchtopk \
     --layer $layer \
     --num_tokens $num_train_tokens \
     --dict_size $dict_size \
+    --top_k $top_k \
     --batch_size $batch_size \
-    --l1_coeff $l1_coeff_gated \
-    --gated_aux_coeff $gated_aux_coeff \
     --perf_log_freq $perf_log_freq \
     --checkpoint_freq $checkpoint_freq \
     --name "$model_basename" \
+    --embedding_glob "test_shards/train/layer_6/*.pt" \
     "${TRAIN_EXTRA[@]}"
 fi
 
@@ -99,26 +104,7 @@ else
     docker start $CONTAINER_NAME
 fi
 
-# for split in "test"; do
-#     if [ ! -d "$disk2_embed_dir/$split/layer_${layer}" ]; then
-#         echo "Did not find directory $disk2_embed_dir/$split/layer_${layer}, extracting embeddings..."
-#         echo "Extracting embeddings for $split split..."
-#         docker exec $CONTAINER_NAME bash -c "
-#         cd $docker_wdr &&
-#         python main/extract_hyena_embeddings.py \
-#         --fasta data/raw/GRCh38.primary_assembly.genome.fa \
-#         --bed data/preprocessed/$split.sub.bed \
-#         --split $split \
-#         --save_dir $disk2_embed_dir \
-#         --seq_len $seq_len \
-#         --layers $layer \
-#         --batch_size $seq_per_shard \
-#         --dtype_save float32
-#         "
-#     else
-#         echo "Embeddings for $split split already exist, skipping extraction."
-#     fi
-# done
+
 
 # Checkpoints to analyse: one marker per training epoch (largest saved step <= epoch end) plus final step
 CK_STEPS=()
@@ -154,11 +140,11 @@ for ckpt_step in "${EPOCH_CKPTS[@]}"; do
     python main/evaluate_sae.py \
       --sae_path ${CHECKPOINT_DIR}/step_${ckpt_step}.pt \
       --cfg_path trained_models/$model_basename/config.json \
-      --test_embeddings_path $docker_base/$disk2_embed_dir/test/layer_${layer} \
+      --test_embeddings_path test_shards/test/layer_${layer} \
       --output_file results/$result_tag/eval_metrics.yaml \
       --device cuda \
       --resume \
-      --test_bed_path data/preprocessed/test.sub.bed \
+      --test_bed_path data/preprocessed/test.test.bed \
       --genome_path data/raw/GRCh38.primary_assembly.genome.fa \
       --hyenadna_checkpoint_path LongSafari/hyenadna-large-1m-seqlen-hf \
       --fidelity_max_seq_len $seq_len \
@@ -218,7 +204,7 @@ PY
     python main/sae_epoch_diagnostics.py \
       --sae_cfg trained_models/$model_basename/config.json \
       --checkpoints_glob ${CHECKPOINT_DIR}/step_${ckpt_step}.pt \
-      --save_dir $disk2_embed_dir \
+      --save_dir test_shards \
       --layer $layer \
       --splits test \
       --bed_dir test_annotations/ \
@@ -234,7 +220,7 @@ PY
   python main/find_top_activations.py \
     --sae_checkpoint  ${CHECKPOINT_DIR}/step_${ckpt_step}.pt \
     --sae_cfg         trained_models/$model_basename/config.json \
-    --embed_dir       $disk2_embed_dir \
+    --embed_dir       test_shards \
     --layer           $layer \
     --splits          test \
     --top_n           200 \
@@ -258,7 +244,7 @@ PY
   python main/concept_feature_analysis.py \
     --sae_checkpoint  ${CHECKPOINT_DIR}/step_${ckpt_step}.pt \
     --sae_cfg         trained_models/$model_basename/config.json \
-    --save_dir        $disk2_embed_dir \
+    --save_dir        test_shards \
     --layer           $layer \
     --splits          test \
     --bed_dir         test_annotations/ \
@@ -277,7 +263,7 @@ PY
   python main/concept_feature_analysis.py \
     --raw_neurons \
     --sae_cfg         trained_models/$model_basename/config.json \
-    --save_dir        $disk2_embed_dir \
+    --save_dir        test_shards \
     --layer           $layer \
     --splits          test \
     --bed_dir         test_annotations/ \
