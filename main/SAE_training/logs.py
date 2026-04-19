@@ -350,7 +350,11 @@ def load_training_checkpoint(
     activation_store,
 ) -> Dict[str, Any]:
     map_dev = next(sae.parameters()).device
-    payload = torch.load(path, map_location=map_dev)
+    # PyTorch 2.6+ defaults weights_only=True; full checkpoints contain numpy/python RNG state.
+    try:
+        payload = torch.load(path, map_location=map_dev, weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location=map_dev)
 
     if payload.get("format_version") != 1:
         raise ValueError(f"Unsupported checkpoint format: {payload.get('format_version')}")
