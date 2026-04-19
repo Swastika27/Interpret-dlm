@@ -4,14 +4,13 @@ set -e
 
 seq_len=512
 seq_per_shard=1024
-layer=6
+layer=7
 
 N_TRAIN=800000
-N_VAL=40000
-N_TEST=40000
+N_TEST=80000
 
 expansion_factor=64
-top_k=32
+top_k=64
 epoch=10
 lr=0.0003
 batch_size=512
@@ -35,13 +34,13 @@ CONTAINER_NAME="hyena"
 eval "$(conda shell.bash hook)"
 conda activate interpret
 
-# model_basename="layer${layer}_${dict_size}_batchtopk_${top_k}_${lr}"
+model_basename="layer${layer}_${dict_size}_batchtopk_${top_k}_${lr}"
 
-# Gated SAE alternative: set l1_coeff_gated / gated_aux_coeff and use model_basename_gated in eval paths below.
-l1_coeff_gated=0.5
-gated_aux_coeff=1.0
-model_basename_gated="layer${layer}_${dict_size}_gated_l1${l1_coeff_gated}_aux${gated_aux_coeff}_${lr}"
-model_basename=$model_basename_gated
+# # Gated SAE alternative: set l1_coeff_gated / gated_aux_coeff and use model_basename_gated in eval paths below.
+# l1_coeff_gated=0.5
+# gated_aux_coeff=1.0
+# model_basename_gated="layer${layer}_${dict_size}_gated_l1${l1_coeff_gated}_aux${gated_aux_coeff}_${lr}"
+# model_basename=$model_basename_gated
 # # train SAE on training embeddings (BAtchtopk)
 # python main/SAE_training/main.py \
 #     --layer $layer \
@@ -72,17 +71,31 @@ if [ -f "$FINAL_MODEL_CKPT" ]; then
   echo "Final model checkpoint already exists (${FINAL_MODEL_CKPT}). Skipping training..."
 else
   echo "Training SAE (target final step: ${num_batches_total}) → ${FINAL_MODEL_CKPT}"
-  python main/SAE_training/main.py \
-    --sae_type gated \
+  # python main/SAE_training/main.py \
+  #   --sae_type gated \
+  #   --layer $layer \
+  #   --num_tokens $num_train_tokens \
+  #   --dict_size $dict_size \
+  #   --batch_size $batch_size \
+  #   --l1_coeff $l1_coeff_gated \
+  #   --gated_aux_coeff $gated_aux_coeff \
+  #   --perf_log_freq $perf_log_freq \
+  #   --checkpoint_freq $checkpoint_freq \
+  #   --name "$model_basename" \
+  #   "${TRAIN_EXTRA[@]}"
+
+
+    python main/SAE_training/main.py \
+    --sae_type batchtopk \
     --layer $layer \
     --num_tokens $num_train_tokens \
     --dict_size $dict_size \
+    --top_k $top_k \
     --batch_size $batch_size \
-    --l1_coeff $l1_coeff_gated \
-    --gated_aux_coeff $gated_aux_coeff \
     --perf_log_freq $perf_log_freq \
     --checkpoint_freq $checkpoint_freq \
     --name "$model_basename" \
+    --embedding_glob "test_shards/train/layer_6/*.pt" \
     "${TRAIN_EXTRA[@]}"
 fi
 
