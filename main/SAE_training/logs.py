@@ -3,12 +3,60 @@ import json
 import os
 import random
 import shutil
+import time
 from functools import partial
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
+
+# region agent log
+_AGENT_DEBUG_LOG = Path(__file__).resolve().parents[2] / "debug-d522a1.log"
+
+
+def _agent_debug_ndjson(
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: Dict[str, Any],
+    run_id: str = "pre-fix",
+) -> None:
+    try:
+        payload = {
+            "sessionId": "d522a1",
+            "timestamp": int(time.time() * 1000),
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "runId": run_id,
+        }
+        with open(_AGENT_DEBUG_LOG, "a", encoding="utf-8") as _f:
+            _f.write(json.dumps(payload, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def _approx_tensor_bytes(obj: Any) -> int:
+    n = 0
+
+    def walk(x: Any) -> None:
+        nonlocal n
+        if torch.is_tensor(x):
+            n += int(x.numel()) * int(x.element_size())
+        elif isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, (list, tuple)):
+            for v in x:
+                walk(v)
+
+    walk(obj)
+    return n
+
+
+# endregion
 
 def init_wandb(cfg):
     return wandb.init(project=cfg["wandb_project"], name=cfg["name"], config=cfg, reinit=True)
@@ -148,6 +196,25 @@ def save_checkpoint(sae, cfg, theta, step):
     if theta is not None:
         payload["theta"] = theta
     torch.save(payload, sae_path)
+    # region agent log
+    try:
+        du = shutil.disk_usage(save_dir)
+        st = os.stat(sae_path)
+        _agent_debug_ndjson(
+            "H4",
+            "logs.py:save_checkpoint",
+            "after sae-only torch.save",
+            {
+                "sae_path": sae_path,
+                "step": int(step),
+                "written_bytes": st.st_size,
+                "disk_free_bytes": du.free,
+            },
+            run_id="pre-fix",
+        )
+    except Exception:
+        pass
+    # endregion
 
     _update_latest_pointer(save_dir, sae_path, "latest.pt")
 
@@ -192,7 +259,70 @@ def save_training_checkpoint(
         "rng": rng,
         "activation_store": activation_store.state_dict(),
     }
-    torch.save(payload, path)
+    # region agent log
+    try:
+        du = shutil.disk_usage(save_dir)
+        approx_b = _approx_tensor_bytes(payload)
+        _agent_debug_ndjson(
+            "H1",
+            "logs.py:save_training_checkpoint",
+            "pre torch.save disk + payload",
+            {
+                "path": path,
+                "save_dir": save_dir,
+                "global_step": int(global_step),
+                "disk_free_bytes": du.free,
+                "disk_total_bytes": du.total,
+                "approx_payload_tensor_bytes": approx_b,
+            },
+            run_id="pre-fix",
+        )
+    except Exception as e:
+        _agent_debug_ndjson(
+            "H3",
+            "logs.py:save_training_checkpoint",
+            "pre-save probe failed",
+            {"err": repr(e)},
+            run_id="pre-fix",
+        )
+    # endregion
+    try:
+        torch.save(payload, path)
+    except Exception as e:
+        # region agent log
+        _agent_debug_ndjson(
+            "H1",
+            "logs.py:save_training_checkpoint",
+            "torch.save raised",
+            {
+                "path": path,
+                "exc_type": type(e).__name__,
+                "exc_repr": repr(e),
+                "errno": getattr(e, "errno", None),
+            },
+            run_id="pre-fix",
+        )
+        # endregion
+        raise
+    # region agent log
+    try:
+        st = os.stat(path)
+        _agent_debug_ndjson(
+            "H2",
+            "logs.py:save_training_checkpoint",
+            "torch.save ok",
+            {"path": path, "written_bytes": st.st_size},
+            run_id="pre-fix",
+        )
+    except Exception as e:
+        _agent_debug_ndjson(
+            "H3",
+            "logs.py:save_training_checkpoint",
+            "post-save stat failed",
+            {"path": path, "err": repr(e)},
+            run_id="pre-fix",
+        )
+    # endregion
     _update_latest_pointer(save_dir, path, "latest_training.pt")
     print(f"  [checkpoint] Saved full training state: {path}")
     return path
