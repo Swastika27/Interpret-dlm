@@ -364,10 +364,19 @@ def load_training_checkpoint(
     activation_store.load_state_dict(payload["activation_store"])
 
     rng = payload.get("rng") or {}
+    # map_location=cuda moves every tensor in the file; RNG states must stay CPU for set_rng_state*.
+    def _rng_to_cpu(x):
+        return x.cpu().contiguous() if torch.is_tensor(x) else x
+
     if "torch" in rng:
-        torch.set_rng_state(rng["torch"])
+        torch.set_rng_state(_rng_to_cpu(rng["torch"]))
     if rng.get("cuda") is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(rng["cuda"])
+        cuda_st = rng["cuda"]
+        if isinstance(cuda_st, (list, tuple)):
+            cuda_st = [_rng_to_cpu(t) for t in cuda_st]
+        else:
+            cuda_st = _rng_to_cpu(cuda_st)
+        torch.cuda.set_rng_state_all(cuda_st)
     if "python" in rng:
         random.setstate(rng["python"])
     if "numpy" in rng:
