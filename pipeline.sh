@@ -91,8 +91,8 @@ else
 fi
 
 for split in "test"; do
-    if [ ! -d "$disk2_embed_dir/$split/layer_${layer}" ]; then
-        echo "Did not find directory $disk2_embed_dir/$split/layer_${layer}, extracting embeddings..."
+    if [ ! -d "$docker_base/$disk2_embed_dir/$split/layer_${layer}" ]; then
+        echo "Did not find directory $docker_base/$disk2_embed_dir/$split/layer_${layer}, extracting embeddings..."
         echo "Extracting embeddings for $split split..."
         docker exec $CONTAINER_NAME bash -c "
         cd $docker_wdr &&
