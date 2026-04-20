@@ -276,6 +276,8 @@ PY
     --splits          test \
     --bed_dir         all_annotations/ \
     --out_dir         results/$result_tag/feature_concept_analysis \
+    --out_dir_excluding_dense results/$result_tag/feature_concept_analysis_excluding_dense \
+    --exclude_feature_indices_json results/$result_tag/epoch_diagnostics/step_$ckpt_step/summary.json results/$result_tag/test_highly_active_features.json \
     --device          cuda \
     --batch_size      1024 \
     --top_k_features  10 \
