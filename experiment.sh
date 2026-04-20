@@ -14,7 +14,7 @@ top_k=64
 epoch=10
 lr=0.0003
 batch_size=512
-checkpoint_freq=100000
+checkpoint_freq=$N_TRAIN
 perf_log_freq=1000
 # For reproducibility
 SEED=42
