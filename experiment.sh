@@ -41,16 +41,7 @@ model_basename="layer${layer}_${dict_size}_batchtopk_${top_k}_${lr}"
 # gated_aux_coeff=1.0
 # model_basename_gated="layer${layer}_${dict_size}_gated_l1${l1_coeff_gated}_aux${gated_aux_coeff}_${lr}"
 # model_basename=$model_basename_gated
-# # train SAE on training embeddings (BAtchtopk)
-# python main/SAE_training/main.py \
-#     --layer $layer \
-#     --num_tokens $num_train_tokens \
-#     --top_k $top_k \
-#     --dict_size $dict_size \
-#     --batch_size $batch_size \
-#     --perf_log_freq $perf_log_freq \
-#     --checkpoint_freq $checkpoint_freq \
-      # --name $model_basename
+
 
 # SAE checkpoints live under trained_models/<name>/checkpoints/
 #   - step_<N>.pt              — weights (+ cfg snapshot) for eval / downstream
@@ -111,27 +102,6 @@ else
     echo "The container $CONTAINER_NAME is not running."
     docker start $CONTAINER_NAME
 fi
-
-# for split in "test"; do
-#     if [ ! -d "$disk2_embed_dir/$split/layer_${layer}" ]; then
-#         echo "Did not find directory $disk2_embed_dir/$split/layer_${layer}, extracting embeddings..."
-#         echo "Extracting embeddings for $split split..."
-#         docker exec $CONTAINER_NAME bash -c "
-#         cd $docker_wdr &&
-#         python main/extract_hyena_embeddings.py \
-#         --fasta data/raw/GRCh38.primary_assembly.genome.fa \
-#         --bed data/preprocessed/$split.sub.bed \
-#         --split $split \
-#         --save_dir $disk2_embed_dir \
-#         --seq_len $seq_len \
-#         --layers $layer \
-#         --batch_size $seq_per_shard \
-#         --dtype_save float32
-#         "
-#     else
-#         echo "Embeddings for $split split already exist, skipping extraction."
-#     fi
-# done
 
 # Checkpoints to analyse: one marker per training epoch (largest saved step <= epoch end) plus final step
 CK_STEPS=()
