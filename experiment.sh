@@ -255,8 +255,10 @@ PY
     --resume
   fi
 
-  echo "running concept -> neuron analysis for $result_tag"
-  if [ -f "results/$result_tag/neuron_concept_analysis/summary.csv" ]; then
+done
+
+  echo "running concept -> neuron analysis for $model_basename"
+  if [ -f "results/$model_basename/neuron_concept_analysis/summary.csv" ]; then
   echo "Output file already exists. Skipping..."
   else
   python main/concept_feature_analysis.py \
@@ -266,14 +268,13 @@ PY
     --layer           $layer \
     --splits          test \
     --bed_dir         all_annotations/ \
-    --out_dir         results/$result_tag/neuron_concept_analysis \
+    --out_dir         results/$model_basename/neuron_concept_analysis \
     --device          cuda \
     --batch_size      1024 \
     --top_k_features  10 \
     --seed            $SEED \
     --resume
   fi
-done
 
 python utils/plot_feature_neuron_concept_assoc.py \
     --results_root results/$model_basename \
