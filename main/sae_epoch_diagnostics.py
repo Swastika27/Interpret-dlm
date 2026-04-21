@@ -26,6 +26,10 @@ This is designed to work with this repo's existing data format:
       "coords": list[(chrom, start, end)] length B
   - Concept annotations are BED files under --bed_dir (0-based, half-open).
 
+Each checkpoint does one full read of every shard for fused metrics (frequencies,
+BED counts, per-dim MSE), then a second full read only for dense-feature
+correlations (which indices depend on the frequency pass).
+
 Example
 -------
 python main/sae_epoch_diagnostics.py ^
@@ -75,7 +79,6 @@ from utils.gpu_setup import (  # type: ignore
 
 from concept_feature_analysis import (  # type: ignore
     BEDIndex,
-    get_activations,
     load_sae,
     restore_cfg_types,
     _build_token_positions,
@@ -189,61 +192,52 @@ def _iter_shard_token_batches(
 
 
 @torch.no_grad()
-def _compute_activation_frequencies(
-    sae,
-    shard_paths: Sequence[str],
-    batch_size: int,
-    use_chr: bool,
-) -> Tuple[np.ndarray, int]:
-    """Return (freq_per_feature [dict_size], n_tokens_total)."""
-    dict_size = int(getattr(sae, "dict_size"))
-    act_sum = np.zeros(dict_size, dtype=np.int64)
-    n_total = 0
-
-    for x, _stats in _iter_shard_token_batches(shard_paths, batch_size, use_chr):
-        acts = get_activations(sae, x, return_cpu=False)
-        active = (acts > 0).cpu().numpy()
-        act_sum += active.sum(axis=0).astype(np.int64)
-        n_total += int(active.shape[0])
-
-    freq = act_sum.astype(np.float64) / max(n_total, 1)
-    return freq, n_total
-
-
-def _compute_bed_counts(
+def _fused_freq_counts_per_dim_mse(
     sae,
     shard_paths: Sequence[str],
     bed_indices: List[BEDIndex],
     batch_size: int,
     act_size: int,
     use_chr: bool,
-) -> dict:
+    device: str,
+) -> Tuple[np.ndarray, int, dict, np.ndarray, int]:
     """
-    Streaming version of concept_feature_analysis accumulation but returns counts
-    for *all* concepts and features.
+    One ``torch.load`` per shard: activation frequencies, BED/concept counts,
+    and per-dimension reconstruction MSE (same ``sae(x)`` outputs as before).
+
+    Dense-feature correlations still need a second pass (indices depend on freq).
     """
     n_concepts = len(bed_indices)
     dict_size = int(getattr(sae, "dict_size"))
-    counts = {
+    act_sum = np.zeros(dict_size, dtype=np.int64)
+    n_tokens_freq = 0
+
+    counts: dict = {
         "pos_acts": np.zeros((n_concepts, dict_size), dtype=np.int64),
         "neg_acts": np.zeros((n_concepts, dict_size), dtype=np.int64),
         "n_pos": np.zeros(n_concepts, dtype=np.int64),
         "n_neg": np.zeros(n_concepts, dtype=np.int64),
     }
 
+    per_dim_sum: Optional[torch.Tensor] = None
+    n_total_mse = 0
+
     for shard_path in shard_paths:
         shard = torch.load(shard_path, map_location="cpu")
         emb = shard["emb"]  # (B, L, D)
         coords_raw = shard.get("coords")
         B, L, D = emb.shape
+        if emb.ndim != 3:
+            raise ValueError(
+                f"{os.path.basename(shard_path)}: expected emb [B,L,D], got {list(emb.shape)}"
+            )
         if D != act_size:
             raise ValueError(f"Embedding dim mismatch: got {D}, expected {act_size}")
-
-        # label tokens per concept (vectorized by chrom)
         if coords_raw is None:
             raise KeyError(
                 f"Shard {os.path.basename(shard_path)} missing 'coords' which is required for BED labeling."
             )
+
         chroms, positions = _build_token_positions(coords_raw, L, use_chr)
         token_labels = np.zeros((B * L, n_concepts), dtype=bool)
         chroms_arr = np.asarray(chroms)
@@ -254,29 +248,41 @@ def _compute_bed_counts(
                 hits = bed.contains_batch(ch, pos_arr)
                 token_labels[flat_idx[hits], ci] = True
 
-        # SAE acts (binarise immediately)
         emb_flat = emb.reshape(B * L, D).float()
-        active_parts: List[np.ndarray] = []
         for start in range(0, B * L, batch_size):
             end = min(start + batch_size, B * L)
-            acts = get_activations(sae, emb_flat[start:end], return_cpu=False)
-            active_parts.append((acts > 0).cpu().numpy())
-        active = np.concatenate(active_parts, axis=0)  # (B*L, dict_size) bool
+            x = tensor_to_device_fast(emb_flat[start:end], device)
+            recon, acts = sae(x)
+            active = (acts > 0).cpu().numpy()
 
-        for ci in range(n_concepts):
-            pos_mask = token_labels[:, ci]
-            neg_mask = ~pos_mask
-            n_pos = int(pos_mask.sum())
-            n_neg = int(neg_mask.sum())
-            if n_pos > 0:
-                counts["pos_acts"][ci] += active[pos_mask].sum(axis=0).astype(np.int64)
-            counts["neg_acts"][ci] += active[neg_mask].sum(axis=0).astype(np.int64)
-            counts["n_pos"][ci] += n_pos
-            counts["n_neg"][ci] += n_neg
+            act_sum += active.sum(axis=0).astype(np.int64)
+            n_tokens_freq += int(active.shape[0])
 
-        del shard, emb, emb_flat, active, token_labels
+            tl = token_labels[start:end]
+            for ci in range(n_concepts):
+                pos_mask = tl[:, ci]
+                neg_mask = ~pos_mask
+                n_pos = int(pos_mask.sum())
+                n_neg = int(neg_mask.sum())
+                if n_pos > 0:
+                    counts["pos_acts"][ci] += active[pos_mask].sum(axis=0).astype(np.int64)
+                counts["neg_acts"][ci] += active[neg_mask].sum(axis=0).astype(np.int64)
+                counts["n_pos"][ci] += n_pos
+                counts["n_neg"][ci] += n_neg
 
-    return counts
+            resid = (x - recon).float()
+            if per_dim_sum is None:
+                per_dim_sum = torch.zeros(resid.shape[1], dtype=torch.float64, device="cpu")
+            per_dim_sum += (resid ** 2).sum(dim=0).double().cpu()
+            n_total_mse += int(resid.shape[0])
+
+        del shard, emb, emb_flat, token_labels
+
+    if per_dim_sum is None or n_total_mse == 0:
+        raise RuntimeError("No tokens processed in fused diagnostics pass.")
+    freq = act_sum.astype(np.float64) / max(n_tokens_freq, 1)
+    per_dim_mse = (per_dim_sum / n_total_mse).numpy()
+    return freq, n_tokens_freq, counts, per_dim_mse, n_total_mse
 
 
 def _f1_matrix_from_counts(counts: dict) -> np.ndarray:
@@ -307,44 +313,6 @@ def _f1_matrix_from_counts(counts: dict) -> np.ndarray:
         where=(precision + recall) > 0,
     )
     return f1
-
-
-@torch.no_grad()
-def _per_dim_mse(
-    sae,
-    shard_paths: Sequence[str],
-    batch_size: int,
-    device: str,
-) -> Tuple[np.ndarray, int]:
-    """
-    Stream per-dimension MSE over shards for reconstruction: mean((x - recon)^2, dim=0).
-    """
-    per_dim_sum: Optional[torch.Tensor] = None
-    n_total = 0
-
-    for shard_path in shard_paths:
-        shard = torch.load(shard_path, map_location="cpu")
-        emb: torch.Tensor = shard["emb"]
-        if emb.ndim != 3:
-            raise ValueError(f"{os.path.basename(shard_path)}: expected emb [B,L,D], got {list(emb.shape)}")
-        B, L, D = emb.shape
-        x_flat = emb.reshape(B * L, D).float()
-
-        for start in range(0, x_flat.shape[0], batch_size):
-            end = min(start + batch_size, x_flat.shape[0])
-            x = tensor_to_device_fast(x_flat[start:end], device)
-            recon, _acts = sae(x)
-            resid = (x - recon).float()
-            if per_dim_sum is None:
-                per_dim_sum = torch.zeros(resid.shape[1], dtype=torch.float64, device="cpu")
-            per_dim_sum += (resid ** 2).sum(dim=0).double().cpu()
-            n_total += int(resid.shape[0])
-
-        del shard, emb, x_flat
-
-    if per_dim_sum is None or n_total == 0:
-        raise RuntimeError("No tokens processed for per-dim MSE.")
-    return (per_dim_sum / n_total).numpy(), n_total
 
 
 @torch.no_grad()
@@ -476,9 +444,15 @@ def main() -> None:
 
         sae = load_sae(cfg, ckpt, args.device)
 
-        # 1) dense features by activation frequency
-        freq, n_tokens = _compute_activation_frequencies(
-            sae, shard_paths, args.eval_batch_size, use_chr
+        # 1) Single pass: activation frequencies, BED/concept counts, per-dim MSE
+        freq, n_tokens, counts, per_dim_mse, n_tokens_mse = _fused_freq_counts_per_dim_mse(
+            sae,
+            shard_paths,
+            bed_indices,
+            args.eval_batch_size,
+            int(cfg["act_size"]),
+            use_chr,
+            args.device,
         )
         order = np.argsort(freq)[::-1]
         top_n = int(min(args.dense_top_n, order.size))
@@ -488,20 +462,11 @@ def main() -> None:
         sparse_mask = np.ones_like(freq, dtype=bool)
         sparse_mask[dense_set] = False
 
-        print(f"Tokens scanned (freq): {n_tokens:,}")
+        print(f"Tokens scanned (fused pass): {n_tokens:,}")
         print(f"Dense features: top_n={len(dense_top)}, freq>{args.dense_freq_threshold} => {len(dense_thr)}; union={len(dense_set)}")
         if dense_set:
             print("  Top dense (idx:freq): " + ", ".join([f"{i}:{freq[i]:.3f}" for i in dense_top[: min(8, len(dense_top))]]))
 
-        # 1+3) concept association full vs sparse (F1-based; BED concepts)
-        counts = _compute_bed_counts(
-            sae=sae,
-            shard_paths=shard_paths,
-            bed_indices=bed_indices,
-            batch_size=args.eval_batch_size,
-            act_size=int(cfg["act_size"]),
-            use_chr=use_chr,
-        )
         f1_full = _f1_matrix_from_counts(counts)  # [C,F]
         assoc_full = (f1_full >= float(args.assoc_f1_threshold))
         concepts_per_feature_full = assoc_full.sum(axis=0)  # [F]
@@ -514,7 +479,7 @@ def main() -> None:
 
         print(f"Polysemanticity proxy (mean concepts/feature with F1≥{args.assoc_f1_threshold}): full={poly_full:.3f}, sparse_only={poly_sparse:.3f}")
 
-        # 2) characterize dense features by correlations with token stats
+        # 2) Second pass: dense-feature correlations (need dense_set from freq)
         dense_corrs = _dense_feature_correlations(
             sae=sae,
             shard_paths=shard_paths,
@@ -524,8 +489,6 @@ def main() -> None:
             use_chr=use_chr,
         )
 
-        # 3) per-dim MSE and overlap with dense features (decoder energy on bad dims)
-        per_dim_mse, n_tokens_mse = _per_dim_mse(sae, shard_paths, args.eval_batch_size, args.device)
         worst_dims = np.argsort(per_dim_mse)[::-1][: int(args.high_mse_top_k)].astype(int)
         per_dim_stats = {
             "per_dim_mse_mean": float(per_dim_mse.mean()),

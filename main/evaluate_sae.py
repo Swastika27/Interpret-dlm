@@ -54,7 +54,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, List, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _REPO_ROOT not in sys.path:
@@ -656,6 +656,185 @@ def calculate_sparsity_metrics(
     }
 
 
+def calculate_reconstruction_and_sparsity_metrics(
+    sae,
+    shard_paths: List[Path],
+    batch_size: int = 4096,
+    device: str = "cpu",
+    resume: bool = False,
+    resume_path: Optional[Path] = None,
+    split_fp: Optional[dict] = None,
+) -> Tuple[dict, dict]:
+    """
+    Single pass over embedding shards: compute reconstruction + sparsity metrics.
+
+    One ``torch.load`` per shard and one ``sae(batch)`` per mini-batch (same as
+    the former separate loops combined). Resume state lives in one file
+    (``resume_path``) with nested ``recon`` / ``sparse`` accumulators.
+    """
+    stat_dev = _metrics_accumulator_device(device)
+    d_model = None
+
+    n_total = 0
+    x_mean = None
+    x_M2 = None
+    res_mean = None
+    res_M2 = None
+    sq_err_sum = torch.tensor(0.0, device=stat_dev)
+    per_dim_mse_sum = None
+
+    l0_sum_t = torch.tensor(0.0, device=stat_dev)
+    feature_act_sum = None
+
+    completed: Set[str] = set()
+    if (
+        resume
+        and resume_path is not None
+        and split_fp is not None
+        and resume_path.is_file()
+    ):
+        blob = torch.load(resume_path, map_location="cpu")
+        if _eval_fp_match(blob.get("fingerprint", {}), split_fp):
+            st = blob.get("state", {})
+            r = st.get("recon", {})
+            s = st.get("sparse", {})
+            ok = (
+                r
+                and s
+                and int(r.get("n_total", 0)) > 0
+                and int(s.get("n_total", 0)) == int(r.get("n_total", 0))
+            )
+            if ok:
+                completed = set(blob.get("completed_shards", []))
+                d_model = int(r["d_model"])
+                n_total = int(r["n_total"])
+                x_mean = r["x_mean"].to(stat_dev).float()
+                x_M2 = r["x_M2"].to(stat_dev).float()
+                res_mean = r["res_mean"].to(stat_dev).float()
+                res_M2 = r["res_M2"].to(stat_dev).float()
+                sq_err_sum = r["sq_err_sum"].to(stat_dev).float()
+                per_dim_mse_sum = r["per_dim_mse_sum"].to(stat_dev).float()
+                lv = s["l0_sum"]
+                if isinstance(lv, torch.Tensor):
+                    l0_sum_t = lv.to(stat_dev).float()
+                else:
+                    l0_sum_t = torch.tensor(float(lv), device=stat_dev)
+                feature_act_sum = s["feature_act_sum"].to(stat_dev).float()
+                if completed:
+                    print(
+                        f"  [resume] Reconstruction+sparsity: "
+                        f"{len(completed)}/{len(shard_paths)} shards already done."
+                    )
+            else:
+                completed = set()
+        else:
+            completed = set()
+
+    with torch.no_grad():
+        for sp in shard_paths:
+            key = str(sp.resolve())
+            if key in completed:
+                continue
+            for batch in tqdm(
+                iter_shard_batches([sp], batch_size, device=device),
+                desc="Recon+Sparsity",
+                leave=False,
+            ):
+                recon, acts = sae(batch)
+                residual = batch - recon
+                b = batch.shape[0]
+
+                if d_model is None:
+                    d_model = batch.shape[1]
+                    x_mean = torch.zeros(d_model, device=stat_dev)
+                    x_M2 = torch.zeros(d_model, device=stat_dev)
+                    res_mean = torch.zeros(d_model, device=stat_dev)
+                    res_M2 = torch.zeros(d_model, device=stat_dev)
+                    per_dim_mse_sum = torch.zeros(d_model, device=stat_dev)
+                    feature_act_sum = torch.zeros(acts.shape[1], device=stat_dev)
+
+                sq_err_sum += (residual ** 2).sum()
+                per_dim_mse_sum += (residual ** 2).sum(dim=0)
+                n_total, x_mean, x_M2 = _update_welford(n_total, x_mean, x_M2, batch)
+                _, res_mean, res_M2 = _update_welford(n_total - b, res_mean, res_M2, residual)
+
+                active = acts != 0
+                l0_sum_t += active.float().sum(dim=-1).sum()
+                feature_act_sum += active.float().sum(dim=0)
+
+            completed.add(key)
+            if (
+                resume
+                and resume_path is not None
+                and split_fp is not None
+                and d_model is not None
+                and feature_act_sum is not None
+            ):
+                _eval_save_resume_tmp(
+                    resume_path,
+                    {
+                        "fingerprint": split_fp,
+                        "completed_shards": sorted(completed),
+                        "state": {
+                            "recon": {
+                                "d_model": d_model,
+                                "n_total": n_total,
+                                "x_mean": x_mean.cpu(),
+                                "x_M2": x_M2.cpu(),
+                                "res_mean": res_mean.cpu(),
+                                "res_M2": res_M2.cpu(),
+                                "sq_err_sum": sq_err_sum.cpu(),
+                                "per_dim_mse_sum": per_dim_mse_sum.cpu(),
+                            },
+                            "sparse": {
+                                "n_total": n_total,
+                                "l0_sum": float(l0_sum_t.item()),
+                                "feature_act_sum": feature_act_sum.cpu(),
+                            },
+                        },
+                    },
+                )
+
+    if n_total == 0:
+        raise RuntimeError("No tokens were processed — check shard_paths.")
+
+    mse = (sq_err_sum / (n_total * d_model)).item()
+    per_dim_mse = per_dim_mse_sum / n_total
+    total_variance = (x_M2 / (n_total - 1)).sum().item()
+    residual_variance = (res_M2 / (n_total - 1)).sum().item()
+    variance_explained = (
+        (1 - residual_variance / total_variance) if total_variance > 0 else 0.0
+    )
+
+    recon_metrics = {
+        "mse": mse,
+        "variance_explained": float(variance_explained),
+        "per_dim_mse_mean": per_dim_mse.mean().item(),
+        "per_dim_mse_std": per_dim_mse.std().item(),
+        "per_dim_mse_max": per_dim_mse.max().item(),
+        "n_tokens": int(n_total),
+    }
+
+    feature_active = feature_act_sum / n_total
+    l0_sparsity = (l0_sum_t / n_total).item()
+    dead_features = (feature_active == 0).sum().item()
+    highly_active = (feature_active > 0.5).sum().item()
+    highly_active_indices = torch.where(feature_active > 0.5)[0].cpu().tolist()
+
+    sparsity_metrics = {
+        "l0_sparsity": l0_sparsity,
+        "l0_sparsity_pct": (l0_sparsity / sae.dict_size) * 100,
+        "dead_features": int(dead_features),
+        "dead_features_pct": (dead_features / sae.dict_size) * 100,
+        "highly_active_features": int(highly_active),
+        "highly_active_pct": (highly_active / sae.dict_size) * 100,
+        "mean_feature_activation_freq": feature_active.mean().item() * 100,
+        "highly_active_feature_indices": [int(i) for i in highly_active_indices],
+        "n_tokens": int(n_total),
+    }
+    return recon_metrics, sparsity_metrics
+
+
 # ---------------------------------------------------------------------------
 # HyenaDNA fidelity — next-token prediction with activation patching
 # ---------------------------------------------------------------------------
@@ -1040,19 +1219,18 @@ def evaluate_sae(
         )
         split_fp["split"] = split_name
 
-        recon_pt = (resume_dir / f"{split_name}_recon.pt") if resume_dir else None
-        sparse_pt = (resume_dir / f"{split_name}_sparsity.pt") if resume_dir else None
+        recon_sparse_pt = (resume_dir / f"{split_name}_recon_sparsity.pt") if resume_dir else None
         fid_pt = (resume_dir / f"{split_name}_fidelity.pt") if resume_dir else None
 
-        # 1. Reconstruction
-        print(f"\n--- 1. Reconstruction Quality ({split_name}) ---")
-        recon_metrics = calculate_reconstruction_metrics(
+        # 1–2. Reconstruction + sparsity (single pass over shards; one SAE forward per batch)
+        print(f"\n--- 1–2. Reconstruction + Sparsity ({split_name}) — single shard pass ---")
+        recon_metrics, sparsity_metrics = calculate_reconstruction_and_sparsity_metrics(
             sae,
             shard_paths,
             batch_size=eval_batch_size,
             device=device_str,
             resume=use_resume,
-            resume_path=recon_pt,
+            resume_path=recon_sparse_pt,
             split_fp=split_fp,
         )
         n_tokens = int(recon_metrics.pop("n_tokens"))
@@ -1062,17 +1240,7 @@ def evaluate_sae(
         for k, v in recon_metrics.items():
             print(f"  {k}: {v:.6f}")
 
-        # 2. Sparsity
-        print(f"\n--- 2. Sparsity ({split_name}) ---")
-        sparsity_metrics = calculate_sparsity_metrics(
-            sae,
-            shard_paths,
-            batch_size=eval_batch_size,
-            device=device_str,
-            resume=use_resume,
-            resume_path=sparse_pt,
-            split_fp=split_fp,
-        )
+        print(f"\n  (Sparsity from same pass)")
         sparsity_metrics.pop("n_tokens", None)
         results[split_name]["sparsity"] = sparsity_metrics
 

@@ -43,7 +43,9 @@ Memory model
 The original script accumulated all shard activations (float32) in RAM before
 any analysis, which caused silent OOM kills on large datasets.
 
-This version streams shards one at a time:
+This version streams shards one at a time (each ``shard_*.pt`` is ``torch.load``-ed
+once per pass; the shard opened for chr-prefix inference is reused when that path
+is processed):
   1. Run the SAE encoder on the shard.
   2. Binarise activations immediately  (active = acts > 0)  — 4× smaller.
   3. Accumulate per-concept TP/FP/FN/TN *counts* into two small int64 matrices
@@ -83,11 +85,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 sys.path.insert(0, os.path.dirname(__file__))
-from utils.genomics_coords import (
-    infer_use_chr_from_save_dir,
-    infer_use_chr_from_chroms,
-    normalize_chrom_name,
-)
+from utils.genomics_coords import infer_use_chr_from_chroms, normalize_chrom_name
 from utils.gpu_setup import configure_cuda_performance, resolve_device_str
 from SAE_training.sae import (
     BatchTopKSAE,
@@ -371,10 +369,11 @@ def accumulate_shard(
     device: str,
     counts: dict,
     use_chr: bool,
+    preloaded_shard: Optional[dict] = None,
 ) -> None:
     """
-    Load one shard, assign labels, run SAE encoder, binarise activations,
-    and accumulate per-concept active-count matrices.
+    Load one shard (unless ``preloaded_shard`` is provided), assign labels, run SAE
+    encoder, binarise activations, and accumulate per-concept active-count matrices.
 
     Float activations are freed before returning so peak RAM stays bounded
     to O(n_concepts x dict_size) across the full dataset.
@@ -382,7 +381,9 @@ def accumulate_shard(
     print(f"    Processing shard {os.path.basename(shard_path)} ...")
     n_concepts = len(bed_indices)
 
-    shard      = torch.load(shard_path, map_location="cpu")
+    shard = preloaded_shard if preloaded_shard is not None else torch.load(
+        shard_path, map_location="cpu"
+    )
     emb        = shard["emb"]       # (B, L, D)
     coords_raw = shard["coords"]    # list[(chrom, start, end)]
     B, L, D    = emb.shape
@@ -791,6 +792,33 @@ def _cofa_collect_shard_plan(save_dir: str, splits: List[str], layer: int) -> Li
     return plan
 
 
+def _cofa_bootstrap_use_chr_from_shard_plan(
+    shard_plan: List[Tuple[str, str]],
+) -> Tuple[bool, Optional[str], Optional[dict]]:
+    """
+    Infer ``use_chr`` from the first shard in ``shard_plan`` that has ``coords``.
+
+    Returns ``(use_chr, path, shard_dict)`` so ``main()`` can skip a duplicate
+    ``torch.load`` when that path is processed.
+    """
+    for _split, shard_path in shard_plan:
+        if not shard_path or not os.path.isfile(shard_path):
+            continue
+        shard = torch.load(shard_path, map_location="cpu")
+        coords = shard.get("coords")
+        if not coords:
+            del shard
+            continue
+        chroms: List[str] = []
+        for row in coords:
+            if isinstance(row, (list, tuple)) and len(row) >= 1 and row[0]:
+                chroms.append(str(row[0]))
+        if chroms:
+            return infer_use_chr_from_chroms(chroms), shard_path, shard
+        del shard
+    return True, None, None
+
+
 def _cofa_concept_outputs_exist(out_dir: str, bed_names: List[str]) -> bool:
     summary = os.path.join(out_dir, "summary.csv")
     if not os.path.isfile(summary):
@@ -884,14 +912,13 @@ def main():
     bed_paths = sorted(glob.glob(os.path.join(args.bed_dir, "*.bed")))
     if not bed_paths:
         raise FileNotFoundError(f"No .bed files found in {args.bed_dir}")
+    shard_plan = _cofa_collect_shard_plan(args.save_dir, args.splits, args.layer)
+    use_chr, pending_shard_path, pending_shard = _cofa_bootstrap_use_chr_from_shard_plan(shard_plan)
     print(f"\nFound {len(bed_paths)} BED concept files:")
-    use_chr = infer_use_chr_from_save_dir(args.save_dir, args.splits, args.layer)
     print(f"  Chromosome naming (match embeddings): use_chr={use_chr}")
     bed_indices = [BEDIndex(p, use_chr=use_chr) for p in bed_paths]
     n_concepts  = len(bed_indices)
     bed_basenames = [Path(p).name for p in bed_paths]
-
-    shard_plan = _cofa_collect_shard_plan(args.save_dir, args.splits, args.layer)
     expected_keys = [_cofa_shard_key(args.save_dir, sp) for _, sp in shard_plan]
     plan_sha = _cofa_shard_plan_sha(expected_keys)
 
@@ -931,7 +958,14 @@ def main():
         )
     ):
         print("[resume] All shards and concept outputs already present — exiting.")
+        del pending_shard
         return
+
+    if pending_shard_path is not None and pending_shard is not None:
+        sk_boot = _cofa_shard_key(args.save_dir, pending_shard_path)
+        if sk_boot in done_keys:
+            pending_shard = None
+            pending_shard_path = None
 
     need_sae = False
     for key in expected_keys:
@@ -966,6 +1000,13 @@ def main():
         if sae is None:
             raise RuntimeError("Internal error: need SAE for unfinished shards.")
         print(f"\nStreaming {split}: {os.path.basename(shard_path)}")
+        shard_preloaded = None
+        if pending_shard is not None and os.path.normpath(shard_path) == os.path.normpath(
+            pending_shard_path or ""
+        ):
+            shard_preloaded = pending_shard
+            pending_shard = None
+            pending_shard_path = None
         accumulate_shard(
             sae         = sae,
             shard_path  = shard_path,
@@ -975,6 +1016,7 @@ def main():
             device      = args.device,
             counts      = counts,
             use_chr     = use_chr,
+            preloaded_shard = shard_preloaded,
         )
         total_shards += 1
         done_keys.add(sk)
