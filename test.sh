@@ -77,18 +77,18 @@ else
   #   --embedding_glob "test_shards/train/layer_6/*.pt" \
   #   "${TRAIN_EXTRA[@]}"
 
-     python main/SAE_training/main.py \
-    --sae_type batchtopk \
-    --layer $layer \
-    --num_tokens $num_train_tokens \
-    --dict_size $dict_size \
-    --top_k $top_k \
-    --batch_size $batch_size \
-    --perf_log_freq $perf_log_freq \
-    --checkpoint_freq $checkpoint_freq \
-    --name "$model_basename" \
-    --embedding_glob "test_shards/train/layer_6/*.pt" \
-    "${TRAIN_EXTRA[@]}"
+    #  python main/SAE_training/main.py \
+    # --sae_type batchtopk \
+    # --layer $layer \
+    # --num_tokens $num_train_tokens \
+    # --dict_size $dict_size \
+    # --top_k $top_k \
+    # --batch_size $batch_size \
+    # --perf_log_freq $perf_log_freq \
+    # --checkpoint_freq $checkpoint_freq \
+    # --name "$model_basename" \
+    # --embedding_glob "test_shards/train/layer_6/*.pt" \
+    # "${TRAIN_EXTRA[@]}"
 fi
 
 
