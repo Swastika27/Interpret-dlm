@@ -408,32 +408,38 @@ def accumulate_shard(
             token_labels[flat_arr[hits], ci] = True
 
     # ---- 2. SAE forward pass — binarise immediately -------------------
-    emb_flat     = emb.reshape(B * L, D)
-    active_parts = []
+    emb_flat = emb.reshape(B * L, D)
+    dev = torch.device(device)
     for start in range(0, B * L, batch_size):
         # print(f"      Running SAE on tokens {start} to {min(start + batch_size, B * L)} ...")
-        end   = min(start + batch_size, B * L)
-        acts = get_activations(sae, emb_flat[start:end], return_cpu=False)
-        active_parts.append((acts > 0).cpu().numpy())
-    active = np.concatenate(active_parts, axis=0)   # (B*L, dict_size) bool
+        end = min(start + batch_size, B * L)
+        acts = get_activations(sae, emb_flat[start:end], return_cpu=False)  # [b, F] on SAE device
+        active_t = acts > 0
 
-    # ---- 3. Accumulate counts per concept -----------------------------
-    for ci in range(n_concepts):
-        # print(f"      Accumulating counts for concept {ci} ('{bed_indices[ci].name}') ...")
-        pos_mask = token_labels[:, ci]
-        neg_mask = ~pos_mask
+        feat_sum_t = active_t.sum(dim=0, dtype=torch.int64)  # [F]
+        feat_sum = feat_sum_t.detach().cpu().numpy()
+        bsz = int(active_t.shape[0])
 
-        n_pos = int(pos_mask.sum())
-        n_neg = int(neg_mask.sum())
-
-        if n_pos > 0:
-            counts["pos_acts"][ci] += active[pos_mask].sum(axis=0)
-        counts["neg_acts"][ci] += active[neg_mask].sum(axis=0)
-        counts["n_pos"][ci]    += n_pos
-        counts["n_neg"][ci]    += n_neg
+        tl = token_labels[start:end]  # numpy bool [b, C]
+        for ci in range(n_concepts):
+            pos_mask_np = tl[:, ci]
+            n_pos = int(pos_mask_np.sum())
+            n_neg = bsz - n_pos
+            if n_pos > 0:
+                pos_mask_t = torch.from_numpy(pos_mask_np).to(
+                    dev, non_blocking=(dev.type == "cuda")
+                )
+                pos_sum_t = active_t[pos_mask_t].sum(dim=0, dtype=torch.int64)
+                pos_sum = pos_sum_t.detach().cpu().numpy()
+                counts["pos_acts"][ci] += pos_sum
+                counts["neg_acts"][ci] += (feat_sum - pos_sum)
+            else:
+                counts["neg_acts"][ci] += feat_sum
+            counts["n_pos"][ci] += n_pos
+            counts["n_neg"][ci] += n_neg
 
     # ---- 4. Explicit cleanup ------------------------------------------
-    del shard, emb, emb_flat, active, token_labels
+    del shard, emb, emb_flat, token_labels
 
 
 # ---------------------------------------------------------------------------
