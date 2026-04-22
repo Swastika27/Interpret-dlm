@@ -56,6 +56,10 @@ def _find_summary(
         p = results_root / sd / step_dir.name / "summary.csv"
         if p.is_file():
             return p
+    for sd in subdirs:
+        p = results_root / sd / "summary.csv"
+        if p.is_file():
+            return p
     return None
 
 
