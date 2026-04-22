@@ -222,6 +222,8 @@ def _fused_freq_counts_per_dim_mse(
     per_dim_sum: Optional[torch.Tensor] = None
     n_total_mse = 0
 
+    dev = torch.device(device)
+
     for shard_path in shard_paths:
         shard = torch.load(shard_path, map_location="cpu")
         emb = shard["emb"]  # (B, L, D)
@@ -253,20 +255,30 @@ def _fused_freq_counts_per_dim_mse(
             end = min(start + batch_size, B * L)
             x = tensor_to_device_fast(emb_flat[start:end], device)
             recon, acts = sae(x)
-            active = (acts > 0).cpu().numpy()
+            active_t = acts > 0  # [b, F] on SAE device
 
-            act_sum += active.sum(axis=0).astype(np.int64)
-            n_tokens_freq += int(active.shape[0])
+            # Per-feature activation counts (for freq + to reuse for neg counts)
+            feat_sum_t = active_t.sum(dim=0, dtype=torch.int64)  # [F]
+            feat_sum = feat_sum_t.detach().cpu().numpy().astype(np.int64, copy=False)
+            act_sum += feat_sum
+            bsz = int(active_t.shape[0])
+            n_tokens_freq += bsz
 
-            tl = token_labels[start:end]
+            # Per-concept counts: avoid NumPy boolean indexing over [b,F] inside the loop.
+            # We keep the heavy reductions in Torch and only move [F] vectors back to CPU.
+            tl = token_labels[start:end]  # numpy bool [b, C]
             for ci in range(n_concepts):
-                pos_mask = tl[:, ci]
-                neg_mask = ~pos_mask
-                n_pos = int(pos_mask.sum())
-                n_neg = int(neg_mask.sum())
+                pos_mask_np = tl[:, ci]
+                n_pos = int(pos_mask_np.sum())
+                n_neg = bsz - n_pos
                 if n_pos > 0:
-                    counts["pos_acts"][ci] += active[pos_mask].sum(axis=0).astype(np.int64)
-                counts["neg_acts"][ci] += active[neg_mask].sum(axis=0).astype(np.int64)
+                    pos_mask_t = torch.from_numpy(pos_mask_np).to(dev, non_blocking=(dev.type == "cuda"))
+                    pos_sum_t = active_t[pos_mask_t].sum(dim=0, dtype=torch.int64)  # [F]
+                    pos_sum = pos_sum_t.detach().cpu().numpy().astype(np.int64, copy=False)
+                    counts["pos_acts"][ci] += pos_sum
+                    counts["neg_acts"][ci] += (feat_sum - pos_sum)
+                else:
+                    counts["neg_acts"][ci] += feat_sum
                 counts["n_pos"][ci] += n_pos
                 counts["n_neg"][ci] += n_neg
 
