@@ -75,7 +75,7 @@ split="train"
 if [ ! -d "data/embeddings/$split/layer_${layer}" ]; then
     echo "Extracting embeddings for $split split..."
     docker exec $CONTAINER_NAME bash -c "
-    cd /workspace/mnt/disk1/swastika/Interpret-dlm &&
+    cd $docker_wdr &&
     python main/extract_hyena_embeddings.py \
     --fasta data/raw/GRCh38.primary_assembly.genome.fa \
     --bed data/preprocessed/$split.sub.bed \
@@ -91,8 +91,8 @@ else
 fi
 
 for split in "test"; do
-    if [ ! -d "$docker_base/$disk2_embed_dir/$split/layer_${layer}" ]; then
-        echo "Did not find directory $docker_base/$disk2_embed_dir/$split/layer_${layer}, extracting embeddings..."
+    if [ ! -d "$disk2_embed_dir/$split/layer_${layer}" ]; then
+        echo "Did not find directory $disk2_embed_dir/$split/layer_${layer}, extracting embeddings..."
         echo "Extracting embeddings for $split split..."
         docker exec $CONTAINER_NAME bash -c "
         cd $docker_wdr &&
@@ -100,7 +100,7 @@ for split in "test"; do
         --fasta data/raw/GRCh38.primary_assembly.genome.fa \
         --bed data/preprocessed/$split.sub.bed \
         --split $split \
-        --save_dir $disk2_embed_dir \
+        --save_dir $docker_base/$disk2_embed_dir \
         --seq_len $seq_len \
         --layers $layer \
         --batch_size $seq_per_shard \
