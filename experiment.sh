@@ -278,4 +278,10 @@ done
 
 python utils/plot_feature_neuron_concept_assoc.py \
     --results_root results/$model_basename \
-    --out_dir results/$model_basename/concept_assoc_plots
+    --metric f1 \
+    --out_dir results/$model_basename/concept_assoc_plots_f1
+
+python utils/plot_feature_neuron_concept_assoc.py \
+    --results_root results/$model_basename \
+    --metric precision \
+    --out_dir results/$model_basename/concept_assoc_plots_prec
