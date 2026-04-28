@@ -4,7 +4,7 @@ set -e
 
 seq_len=512
 seq_per_shard=1024
-layer=5
+layer=4
 
 N_TRAIN=800000
 N_TEST=80000
