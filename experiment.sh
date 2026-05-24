@@ -214,25 +214,25 @@ PY
       --high_mse_top_k 20
   fi
 
-  # python main/find_top_activations.py \
-  #   --sae_checkpoint  ${CHECKPOINT_DIR}/step_${ckpt_step}.pt \
-  #   --sae_cfg         trained_models/$model_basename/config.json \
-  #   --embed_dir       $disk2_embed_dir \
-  #   --layer           $layer \
-  #   --splits          test \
-  #   --top_n           200 \
-  #   --out_dir         results/$result_tag/top_activations \
-  #   --device          cuda \
-  #   --batch_size      2048 \
-  #   --num_workers     4 \
-  #   --resume
+  python main/find_top_activations.py \
+    --sae_checkpoint  ${CHECKPOINT_DIR}/step_${ckpt_step}.pt \
+    --sae_cfg         trained_models/$model_basename/config.json \
+    --embed_dir       $disk2_embed_dir \
+    --layer           $layer \
+    --splits          test \
+    --top_n           50 \
+    --out_dir         results/$result_tag/top_activations \
+    --device          cuda \
+    --batch_size      2048 \
+    --num_workers     4 \
+    --resume
 
-  # echo "Anotating top activations with overlapping concepts" 
-  # python main/annotate_top_activations.py \
-  #   --top_activations  results/$result_tag/top_activations/top_activations.pt \
-  #   --bed_dir          all_annotations \
-  #   --out_dir          results/$result_tag/activation_concept_assoc \
-  #   --resume
+  echo "Anotating top activations with overlapping concepts" 
+  python main/annotate_top_activations.py \
+    --top_activations  results/$result_tag/top_activations/top_activations.pt \
+    --bed_dir          all_annotations \
+    --out_dir          results/$result_tag/activation_concept_assoc \
+    --resume
 
   echo "running concept -> feature analysis for $result_tag"
   if [ -f "results/$result_tag/feature_concept_analysis/summary.csv" ]; then
