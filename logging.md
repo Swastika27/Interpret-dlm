@@ -124,12 +124,13 @@ python data_utils/extract_cpg_labels.py \
 Clinvar labels benign, pathogenic
 ```bash
 python data_utils/extract_clinvar_labels.py \
---infile data/annotations/clinvar/variant_summary.txt \
---outdir data/annotations/clinvar \
---assembly GRCh38 \
---germline_only \
---include_likely \
---exclude_conflicting
+    --infile data/annotations/clinvar/variant_summary.txt \
+    --outdir all_annotations \
+    --assembly GRCh38 \
+    --germline_only \
+    --exclude_conflicting \
+    --include_likely \
+    --max_variant_bp 50
 ```
 
 
