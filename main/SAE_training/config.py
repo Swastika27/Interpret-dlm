@@ -64,7 +64,7 @@ def get_default_cfg():
 
 
 def post_init_cfg(cfg):
-    cfg["embedding_glob"] = f"data/embeddings/train/layer_{cfg['layer']}/*.pt"
+    
     st = cfg.get("sae_type", "batchtopk").lower()
     if st == "gated" and cfg.get("gated_use_paper_optimizer", True):
         cfg["beta1"] = 0.0

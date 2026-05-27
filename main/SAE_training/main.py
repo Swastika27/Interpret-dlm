@@ -27,7 +27,7 @@ def parse_args():
                         help="Total number of tokens to train on")
     parser.add_argument("--batch_size", type=int, default=512,
                         help="Batch size")
-    parser.add_argument("--embedding_glob", type=str, default="data/embeddings/train/layer_6/*.pt",
+    parser.add_argument("--embedding_glob", type=str, required=True,
                         help="Glob pattern for embedding files")
     parser.add_argument("--aux_penalty", type=float, default=1/32,
                         help="Auxiliary penalty coefficient")

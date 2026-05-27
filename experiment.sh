@@ -25,6 +25,7 @@ num_train_tokens=$(($N_TRAIN * $epoch * $seq_len))
 num_batches_total=$(( num_train_tokens / batch_size ))
 batches_per_epoch=$(( num_batches_total / epoch ))
 
+disk1_embed_dir=/mnt/disk1/swastika/Interpret-dlm/data/embeddings/
 disk2_embed_dir=/mnt/disk2/2005027/data/embeddings
 docker_base="/workspace"
 docker_wdr=/workspace/mnt/disk1/swastika/Interpret-dlm
@@ -86,7 +87,7 @@ else
     --perf_log_freq $perf_log_freq \
     --checkpoint_freq $checkpoint_freq \
     --name "$model_basename" \
-    --embedding_glob "test_shards/train/layer_6/*.pt" \
+    --embedding_glob "$disk1_embed_dir/train/layer_${layer}/*.pt" \
     "${TRAIN_EXTRA[@]}"
 fi
 
