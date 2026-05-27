@@ -500,18 +500,21 @@ class JumpReLUInferenceSAE(torch.nn.Module):
 
         self.dict_size = self.W_enc.shape[1]
 
+    # main/SAE_training/sae.py, in JumpReLUInferenceSAE.forward
     def forward(self, x):
-
+        if getattr(self, "input_unit_norm", True):
+            x_mean = x.mean(dim=-1, keepdim=True)
+            x = x - x_mean
+            x_std = x.std(dim=-1, keepdim=True)
+            x = x / (x_std + 1e-5)
         x_cent = x - self.b_dec
-
         acts = torch.relu(x_cent @ self.W_enc)
-
-        # JumpReLU gating
         acts = acts * (acts > self.theta)
-
         x_reconstruct = acts @ self.W_dec + self.b_dec
-
+        if getattr(self, "input_unit_norm", True):
+            x_reconstruct = x_reconstruct * x_std + x_mean
         return x_reconstruct, acts
+
 
 
 class GatedInferenceSAE(nn.Module):
