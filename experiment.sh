@@ -210,7 +210,7 @@ PY
       --device cuda \
       --eval_batch_size 1024 \
       --dense_top_n "$dense_top_n" \
-      --dense_freq_threshold 0.10 \
+      --dense_freq_threshold 0.04 \
       --assoc_f1_threshold 0.10 \
       --high_mse_top_k 20
   fi
