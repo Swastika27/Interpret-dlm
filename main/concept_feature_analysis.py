@@ -561,7 +561,7 @@ def compute_metrics_from_counts(
                 "fp":                  int(round(FP[fi])),
                 "fn":                  int(round(FN[fi])),
                 "n_positive_tokens":   n_pos,
-                "n_negative_tokens":   n_neg_eff,
+                "n_negative_tokens":   n_neg,
                 "baseline_prevalence": float(baseline_prevalence[fi]),
             })
         all_rows.append(rows)
