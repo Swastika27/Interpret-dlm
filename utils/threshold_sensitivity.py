@@ -44,7 +44,8 @@ def load_feature_concept_matrix(fca_root: Path):
         if n_features is None:
             n_features = len(df)
         f1_cols[cdir.name] = df["f1"].to_numpy()
-        prev = float(df["baseline_prevalence"].iloc[0])
+        prev_col = "prevalence" if "prevalence" in df.columns else "baseline_prevalence"
+        prev = float(df[prev_col].iloc[0])
         prevalences[cdir.name] = prev
         freq = df["recall_tpr"].to_numpy() * prev + df["fpr"].to_numpy() * (1.0 - prev)
         freq_estimates[cdir.name] = freq

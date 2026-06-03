@@ -25,6 +25,13 @@ num_train_tokens=$(($N_TRAIN * $epoch * $seq_len))
 num_batches_total=$(( num_train_tokens / batch_size ))
 batches_per_epoch=$(( num_batches_total / epoch ))
 
+# Single source of truth for "dense" features: 10x the expected uniform firing rate
+# (= 10 * top_k / dict_size = 10 * mean activation frequency). For k=64, F=16384 -> 0.039.
+dense_multiple=10
+dense_freq_threshold=$(python3 -c "print(${dense_multiple}*${top_k}/${dict_size})")
+# Association gate for the polysemanticity proxy: |MCC| >= this (MCC zero = chance).
+assoc_mcc_threshold=0.10
+
 disk1_embed_dir=/mnt/disk1/swastika/Interpret-dlm/data/embeddings/
 disk2_embed_dir=/mnt/disk2/2005027/data/embeddings
 docker_base="/workspace"
@@ -151,51 +158,10 @@ for ckpt_step in "${EPOCH_CKPTS[@]}"; do
   fi
 
   # Dense-feature diagnostics (exclude dense features, correlate with token stats, worst-MSE dims)
-  # Read dense_top_n from eval_metrics.yaml (uses sparsity.highly_active_features, which is what you observed as "8").
-  eval_yaml="results/$result_tag/eval_metrics.yaml"
-  # #region agent log
-  printf '{"sessionId":"ff640b","runId":"pre-fix","hypothesisId":"H0","location":"experiment.sh:eval_yaml","message":"Dense-top-N parse starting","data":{"eval_yaml":"%s","ckpt_step":"%s"},"timestamp":%s}\n' \
-    "$eval_yaml" "$ckpt_step" "$(date +%s%3N)" >> debug-ff640b.log
-  # #endregion
-  dense_top_n=$(
-    python - "$eval_yaml" <<'PY'
-import sys
-from pathlib import Path
-try:
-    import yaml
-except Exception as e:
-    raise SystemExit("Missing PyYAML. Install into this environment: pip install pyyaml") from e
-
-path = Path(sys.argv[1])
-if not path.is_file():
-    print("8")  # safe fallback
-    raise SystemExit(0)
-
-data = yaml.safe_load(path.read_text(encoding="utf-8"))
-def get_int(d, keys, default=None):
-    cur = d
-    for k in keys:
-        if not isinstance(cur, dict) or k not in cur:
-            return default
-        cur = cur[k]
-    try:
-        return int(cur)
-    except Exception:
-        return default
-
-v = get_int(data, ["val", "sparsity", "highly_active_features"])
-t = get_int(data, ["test", "sparsity", "highly_active_features"])
-
-# Prefer a conservative choice (max across splits), fall back to 8 if missing.
-vals = [x for x in [v, t] if x is not None]
-print(max(vals) if vals else 8)
-PY
-  )
-  # #region agent log
-  printf '{"sessionId":"ff640b","runId":"pre-fix","hypothesisId":"H1","location":"experiment.sh:dense_top_n","message":"Dense-top-N parsed","data":{"dense_top_n":"%s"},"timestamp":%s}\n' \
-    "$dense_top_n" "$(date +%s%3N)" >> debug-ff640b.log
-  # #endregion
-  echo "Running dense-feature epoch diagnostics (dense_top_n=$dense_top_n) for $result_tag"
+  # Dense is defined by ONE rule: freq > dense_freq_threshold (= 10*top_k/dict_size).
+  # The old coupling that read sparsity.highly_active_features (the >0.5 count) as
+  # --dense_top_n is removed; we rely on the threshold only (--dense_top_n 0).
+  echo "Running dense-feature epoch diagnostics (dense_freq_threshold=$dense_freq_threshold) for $result_tag"
   if [ -f "results/$result_tag/epoch_diagnostics/epoch_summary.csv" ]; then
     echo "Diagnostics already exist. Skipping..."
   else
@@ -209,9 +175,10 @@ PY
       --out_dir results/$result_tag/epoch_diagnostics \
       --device cuda \
       --eval_batch_size 1024 \
-      --dense_top_n "$dense_top_n" \
-      --dense_freq_threshold 0.04 \
+      --dense_top_n 0 \
+      --dense_freq_threshold $dense_freq_threshold \
       --assoc_f1_threshold 0.6666 \
+      --assoc_mcc_threshold $assoc_mcc_threshold \
       --high_mse_top_k 20
   fi
 
@@ -257,7 +224,8 @@ PY
     --bed_dir         all_annotations/ \
     --out_dir         results/$result_tag/feature_concept_analysis \
     --out_dir_excluding_dense results/$result_tag/feature_concept_analysis_excluding_dense \
-    --exclude_feature_indices_json results/$result_tag/epoch_diagnostics/step_$ckpt_step/summary.json results/$result_tag/test_highly_active_features.json \
+    --exclude_feature_indices_json results/$result_tag/epoch_diagnostics/step_$ckpt_step/summary.json results/$result_tag/test_dense_features.json \
+    --rank_by         mcc \
     --device          cuda \
     --batch_size      1024 \
     --top_k_features  10 \
@@ -279,6 +247,7 @@ done
     --splits          test \
     --bed_dir         all_annotations/ \
     --out_dir         results/$model_basename/neuron_concept_analysis \
+    --rank_by         mcc \
     --device          cuda \
     --batch_size      1024 \
     --top_k_features  10 \

@@ -11,7 +11,7 @@ RESULTS = os.path.abspath(RESULTS)
 
 # Concepts to drop as degenerate (prevalence ~1 -> trivial F1); keep a clean set too.
 # DEGENERATE = {"clinvar_GRCh38_benign", "clinvar_GRCh38_pathogenic", "encode_CTCF-only"}
-DEGENATE = {}
+DEGENERATE = {}
 
 def parse_simple_yaml(path):
     """Minimal parser for the flat 2-space-indented eval_metrics.yaml produced here."""

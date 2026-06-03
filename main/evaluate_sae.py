@@ -664,6 +664,7 @@ def calculate_reconstruction_and_sparsity_metrics(
     resume: bool = False,
     resume_path: Optional[Path] = None,
     split_fp: Optional[dict] = None,
+    dense_freq_threshold: Optional[float] = None,
 ) -> Tuple[dict, dict]:
     """
     Single pass over embedding shards: compute reconstruction + sparsity metrics.
@@ -818,6 +819,7 @@ def calculate_reconstruction_and_sparsity_metrics(
     feature_active = feature_act_sum / n_total
     l0_sparsity = (l0_sum_t / n_total).item()
     dead_features = (feature_active == 0).sum().item()
+    # "always-on" diagnostic: fires on >50% of tokens (informational only; usually ~0).
     highly_active = (feature_active > 0.5).sum().item()
     highly_active_indices = torch.where(feature_active > 0.5)[0].cpu().tolist()
 
@@ -826,12 +828,27 @@ def calculate_reconstruction_and_sparsity_metrics(
         "l0_sparsity_pct": (l0_sparsity / sae.dict_size) * 100,
         "dead_features": int(dead_features),
         "dead_features_pct": (dead_features / sae.dict_size) * 100,
+        "always_on_features": int(highly_active),
+        "always_on_pct": (highly_active / sae.dict_size) * 100,
+        "mean_feature_activation_freq": feature_active.mean().item() * 100,
+        "always_on_feature_indices": [int(i) for i in highly_active_indices],
+        # Back-compat aliases (old key names == the >0.5 "always-on" set):
         "highly_active_features": int(highly_active),
         "highly_active_pct": (highly_active / sae.dict_size) * 100,
-        "mean_feature_activation_freq": feature_active.mean().item() * 100,
         "highly_active_feature_indices": [int(i) for i in highly_active_indices],
         "n_tokens": int(n_total),
     }
+
+    # Unified "dense" definition (single source of truth shared with diagnostics &
+    # the concept-analysis exclusion list): freq > dense_freq_threshold, where the
+    # principled threshold is ~10 * top_k / dict_size (= mean firing rate × 10).
+    if dense_freq_threshold is not None:
+        dense_mask = feature_active > float(dense_freq_threshold)
+        dense_indices = torch.where(dense_mask)[0].cpu().tolist()
+        sparsity_metrics["dense_freq_threshold"] = float(dense_freq_threshold)
+        sparsity_metrics["dense_features"] = int(len(dense_indices))
+        sparsity_metrics["dense_features_pct"] = (len(dense_indices) / sae.dict_size) * 100
+        sparsity_metrics["dense_feature_indices"] = [int(i) for i in dense_indices]
     return recon_metrics, sparsity_metrics
 
 
@@ -1177,6 +1194,18 @@ def evaluate_sae(
     sae = load_sae(cfg, checkpoint_path=sae_path, device=device_str)
     print(f"SAE: {cfg['dict_size']} features, {cfg['act_size']}D\n")
 
+    # Unified dense-feature threshold = DENSE_MULTIPLE * top_k / dict_size
+    # (= 10 * mean firing rate). Single source of truth for "dense", shared with
+    # sae_epoch_diagnostics and the concept-analysis exclusion list.
+    DENSE_MULTIPLE = 10
+    _top_k = cfg.get("top_k") or 0
+    dense_freq_threshold = (
+        DENSE_MULTIPLE * _top_k / cfg["dict_size"] if _top_k else None
+    )
+    if dense_freq_threshold is not None:
+        print(f"Dense threshold: {DENSE_MULTIPLE} * {_top_k}/{cfg['dict_size']} = "
+              f"{dense_freq_threshold:.5f}")
+
     use_resume = bool(resume and output_file)
     if resume and not output_file:
         print("⚠️  --resume ignored without --output_file (no resume directory).")
@@ -1232,6 +1261,7 @@ def evaluate_sae(
             resume=use_resume,
             resume_path=recon_sparse_pt,
             split_fp=split_fp,
+            dense_freq_threshold=dense_freq_threshold,
         )
         n_tokens = int(recon_metrics.pop("n_tokens"))
         results[split_name] = {"n_tokens": n_tokens}
@@ -1245,24 +1275,33 @@ def evaluate_sae(
         results[split_name]["sparsity"] = sparsity_metrics
 
         if output_file is not None:
-            hi = sparsity_metrics.get("highly_active_feature_indices")
+            out_parent = Path(output_file).parent
+            out_parent.mkdir(parents=True, exist_ok=True)
+            # Always-on (>0.5) sidecar — back-compat name, informational.
+            hi = sparsity_metrics.get("always_on_feature_indices")
             if hi is not None:
-                sidecar = Path(output_file).parent / f"{split_name}_highly_active_features.json"
-                sidecar.parent.mkdir(parents=True, exist_ok=True)
+                sidecar = out_parent / f"{split_name}_highly_active_features.json"
                 with open(sidecar, "w", encoding="utf-8") as jf:
-                    json.dump(
-                        {
-                            "source": "evaluate_sae.calculate_sparsity_metrics",
-                            "activation_freq_threshold": 0.5,
-                            "indices": hi,
-                        },
-                        jf,
-                        indent=2,
-                    )
-                print(f"  Wrote highly-active index list: {sidecar}")
+                    json.dump({
+                        "source": "evaluate_sae (always-on >0.5)",
+                        "activation_freq_threshold": 0.5,
+                        "indices": hi,
+                    }, jf, indent=2)
+                print(f"  Wrote always-on (>0.5) index list: {sidecar}")
+            # Unified dense sidecar — the canonical exclusion list for concept analysis.
+            di = sparsity_metrics.get("dense_feature_indices")
+            if di is not None:
+                dsidecar = out_parent / f"{split_name}_dense_features.json"
+                with open(dsidecar, "w", encoding="utf-8") as jf:
+                    json.dump({
+                        "source": "evaluate_sae (unified dense = freq > 10*top_k/dict_size)",
+                        "dense_freq_threshold": sparsity_metrics.get("dense_freq_threshold"),
+                        "indices": di,
+                    }, jf, indent=2)
+                print(f"  Wrote dense ({sparsity_metrics.get('dense_features')}) index list: {dsidecar}")
 
         for k, v in sparsity_metrics.items():
-            if k == "highly_active_feature_indices":
+            if k.endswith("_feature_indices"):
                 n = len(v) if isinstance(v, list) else 0
                 print(f"  {k}: {n} feature(s) (list also in YAML and sidecar JSON)")
                 continue

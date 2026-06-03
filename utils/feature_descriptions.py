@@ -31,7 +31,10 @@ def feature_freq(fca_root: Path) -> pd.Series:
         df = pd.read_csv(af).sort_values("feature_idx")
         if len(df) != 16384:
             continue
-        prev = float(df["baseline_prevalence"].iloc[0])
+        # New schema stores the (constant) concept token prevalence as "prevalence";
+        # old schema stored per-feature recall mislabelled as "baseline_prevalence".
+        prev_col = "prevalence" if "prevalence" in df.columns else "baseline_prevalence"
+        prev = float(df[prev_col].iloc[0])
         freq = df["recall_tpr"].to_numpy() * prev + df["fpr"].to_numpy() * (1 - prev)
         return pd.Series(freq, index=df["feature_idx"].astype(int).to_numpy())
     raise RuntimeError("no usable concept in fca_root")

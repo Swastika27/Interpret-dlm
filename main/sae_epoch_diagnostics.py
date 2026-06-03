@@ -299,8 +299,8 @@ def _fused_freq_counts_per_dim_mse(
 
 def _f1_matrix_from_counts(counts: dict) -> np.ndarray:
     """
-    Return f1 matrix shaped [n_concepts, dict_size] with class-imbalance correction
-    matching concept_feature_analysis.py (scale negatives down to n_pos).
+    Return balanced-F1 matrix [n_concepts, dict_size] (negatives scaled to n_pos).
+    Kept for continuity with earlier diagnostics; see also _mcc_matrix_from_counts.
     """
     pos_acts = counts["pos_acts"].astype(np.float64)  # [C,F]
     neg_acts = counts["neg_acts"].astype(np.float64)  # [C,F]
@@ -325,6 +325,29 @@ def _f1_matrix_from_counts(counts: dict) -> np.ndarray:
         where=(precision + recall) > 0,
     )
     return f1
+
+
+def _mcc_matrix_from_counts(counts: dict) -> np.ndarray:
+    """
+    Return RAW Matthews-correlation matrix [n_concepts, dict_size].
+
+    MCC has a true zero at chance (an always-on feature -> MCC 0), so |MCC| >= threshold
+    is a far better "is this feature associated with the concept" test than balanced F1
+    >= 0.1 (which an always-on feature passes for every concept). Used for the
+    polysemanticity proxy alongside the legacy balanced-F1 one.
+    """
+    pos_acts = counts["pos_acts"].astype(np.float64)   # [C,F]
+    neg_acts = counts["neg_acts"].astype(np.float64)   # [C,F]
+    n_pos = counts["n_pos"].astype(np.float64)[:, None]  # [C,1]
+    n_neg = counts["n_neg"].astype(np.float64)[:, None]  # [C,1]
+
+    TP = pos_acts
+    FP = neg_acts
+    FN = n_pos - TP
+    TN = n_neg - FP
+    num = TP * TN - FP * FN
+    den = np.sqrt((TP + FP) * (TP + FN) * (TN + FP) * (TN + FN))
+    return np.divide(num, den, out=np.zeros_like(num), where=den > 0)
 
 
 @torch.no_grad()
@@ -398,9 +421,15 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--eval_batch_size", type=int, default=2048)
 
-    p.add_argument("--dense_top_n", type=int, default=8, help="Always treat top-N freq features as dense")
-    p.add_argument("--dense_freq_threshold", type=float, default=0.10, help="Also treat freq > threshold as dense")
-    p.add_argument("--assoc_f1_threshold", type=float, default=0.10, help="Concept-feature assoc if F1 >= this")
+    p.add_argument("--dense_top_n", type=int, default=0,
+                   help="Also treat top-N freq features as dense (0=off; prefer threshold only)")
+    p.add_argument("--dense_freq_threshold", type=float, default=0.04,
+                   help="Dense if activation freq > threshold. Principled value is "
+                        "~10*top_k/dict_size (=0.039 for k=64,F=16384); pass it explicitly.")
+    p.add_argument("--assoc_f1_threshold", type=float, default=0.10,
+                   help="Legacy balanced-F1 association gate (kept for continuity).")
+    p.add_argument("--assoc_mcc_threshold", type=float, default=0.10,
+                   help="Concept-feature association if |MCC| >= this (recommended; MCC zero=chance).")
     p.add_argument("--high_mse_top_k", type=int, default=20, help="How many worst per-dim MSE dims to analyze")
     return p.parse_args()
 
@@ -479,17 +508,28 @@ def main() -> None:
         if dense_set:
             print("  Top dense (idx:freq): " + ", ".join([f"{i}:{freq[i]:.3f}" for i in dense_top[: min(8, len(dense_top))]]))
 
+        # Legacy balanced-F1 polysemanticity proxy (kept for continuity; the F1>=0.1
+        # gate lets always-on features count for every concept — see MCC proxy below).
         f1_full = _f1_matrix_from_counts(counts)  # [C,F]
         assoc_full = (f1_full >= float(args.assoc_f1_threshold))
-        concepts_per_feature_full = assoc_full.sum(axis=0)  # [F]
-        poly_full = float(concepts_per_feature_full.mean())
-
+        poly_full = float(assoc_full.sum(axis=0).mean())
         f1_sparse = f1_full[:, sparse_mask]
         assoc_sparse = (f1_sparse >= float(args.assoc_f1_threshold))
-        concepts_per_feature_sparse = assoc_sparse.sum(axis=0)
-        poly_sparse = float(concepts_per_feature_sparse.mean()) if concepts_per_feature_sparse.size else 0.0
+        poly_sparse = float(assoc_sparse.sum(axis=0).mean()) if f1_sparse.shape[1] else 0.0
 
-        print(f"Polysemanticity proxy (mean concepts/feature with F1≥{args.assoc_f1_threshold}): full={poly_full:.3f}, sparse_only={poly_sparse:.3f}")
+        # MCC-based polysemanticity proxy (recommended): |MCC| >= threshold, with MCC's
+        # true zero baseline. mean concepts/feature exceeding the threshold.
+        mcc_full = _mcc_matrix_from_counts(counts)  # [C,F]
+        assoc_mcc_full = (np.abs(mcc_full) >= float(args.assoc_mcc_threshold))
+        poly_mcc_full = float(assoc_mcc_full.sum(axis=0).mean())
+        mcc_sparse = mcc_full[:, sparse_mask]
+        assoc_mcc_sparse = (np.abs(mcc_sparse) >= float(args.assoc_mcc_threshold))
+        poly_mcc_sparse = float(assoc_mcc_sparse.sum(axis=0).mean()) if mcc_sparse.shape[1] else 0.0
+
+        print(f"Polysemanticity proxy [balanced F1≥{args.assoc_f1_threshold}]: "
+              f"full={poly_full:.3f}, sparse_only={poly_sparse:.3f}")
+        print(f"Polysemanticity proxy [|MCC|≥{args.assoc_mcc_threshold}]:    "
+              f"full={poly_mcc_full:.3f}, sparse_only={poly_mcc_sparse:.3f}")
 
         # 2) Second pass: dense-feature correlations (need dense_set from freq)
         dense_corrs = _dense_feature_correlations(
@@ -539,6 +579,9 @@ def main() -> None:
             "assoc_f1_threshold": float(args.assoc_f1_threshold),
             "polysemanticity_proxy_full": poly_full,
             "polysemanticity_proxy_sparse_only": poly_sparse,
+            "assoc_mcc_threshold": float(args.assoc_mcc_threshold),
+            "polysemanticity_proxy_mcc_full": poly_mcc_full,
+            "polysemanticity_proxy_mcc_sparse_only": poly_mcc_sparse,
             "per_dim_mse": per_dim_stats,
         }
         with open(os.path.join(run_dir, "summary.json"), "w", encoding="utf-8") as fh:
@@ -578,6 +621,8 @@ def main() -> None:
             "dense_union_n": len(dense_set),
             "poly_full": poly_full,
             "poly_sparse": poly_sparse,
+            "poly_mcc_full": poly_mcc_full,
+            "poly_mcc_sparse": poly_mcc_sparse,
             "per_dim_mse_mean": per_dim_stats["per_dim_mse_mean"],
             "per_dim_mse_max": per_dim_stats["per_dim_mse_max"],
         }

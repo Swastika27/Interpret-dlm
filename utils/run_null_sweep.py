@@ -96,6 +96,12 @@ def parse_args():
     p.add_argument("--splits", nargs="+", default=["test"])
     p.add_argument("--n_permutations", type=int, default=200)
     p.add_argument("--candidate_top_k", type=int, default=10)
+    p.add_argument("--candidates_subdir", default="feature_concept_analysis",
+                   help="Per-step subdir holding all_features.csv to draw candidates from "
+                        "(e.g. feature_concept_analysis or feature_concept_analysis_mcc).")
+    p.add_argument("--metric", default="mcc",
+                   choices=["mcc", "enrichment", "f1", "precision", "balanced_f1"],
+                   help="Metric whose null distribution is built (default: mcc).")
     p.add_argument("--batch_size", type=int, default=4096)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--modes", nargs="+", default=["circular", "blockswap"],
@@ -158,27 +164,30 @@ def main():
     for L, tag, best_step in plan:
         ckpt = os.path.join(a.trained_models_root, tag, "checkpoints", f"step_{best_step}.pt")
         cfg = os.path.join(a.trained_models_root, tag, "config.json")
-        cand = os.path.join(a.results_root, tag, f"step{best_step}", "feature_concept_analysis")
+        cand = os.path.join(a.results_root, tag, f"step{best_step}", a.candidates_subdir)
         for mode in a.modes:
+            tag_suffix = f"{mode}_{a.metric}"
             if not a.skip_sae:
                 out = os.path.join(a.results_root, tag, f"step{best_step}",
-                                   f"concept_feature_null_{mode}")
-                jobs.append((f"L{L} SAE {mode}", [
+                                   f"concept_feature_null_{tag_suffix}")
+                jobs.append((f"L{L} SAE {mode}/{a.metric}", [
                     a.python, null_script,
                     "--sae_checkpoint", ckpt, "--sae_cfg", cfg,
                     "--save_dir", a.save_dir, "--layer", str(L),
                     "--splits", *a.splits, "--bed_dir", a.bed_dir,
                     "--candidates_from", cand, "--candidate_top_k", str(a.candidate_top_k),
+                    "--metric", a.metric,
                     "--n_permutations", str(a.n_permutations), "--null_mode", mode,
                     "--batch_size", str(a.batch_size), "--seed", str(a.seed),
                     "--device", a.device, "--out_dir", out,
                 ]))
             if not a.skip_neurons:
-                out = os.path.join(a.results_root, tag, f"neuron_concept_null_{mode}")
-                jobs.append((f"L{L} neuron {mode}", [
+                out = os.path.join(a.results_root, tag, f"neuron_concept_null_{tag_suffix}")
+                jobs.append((f"L{L} neuron {mode}/{a.metric}", [
                     a.python, null_script, "--raw_neurons", "--sae_cfg", cfg,
                     "--save_dir", a.save_dir, "--layer", str(L),
                     "--splits", *a.splits, "--bed_dir", a.bed_dir,
+                    "--metric", a.metric,
                     "--n_permutations", str(a.n_permutations), "--null_mode", mode,
                     "--batch_size", str(a.batch_size), "--seed", str(a.seed),
                     "--device", a.device, "--out_dir", out,
@@ -210,8 +219,8 @@ def main():
         plot = os.path.join(HERE, "plot_null_concept.py")
         for mode in a.modes:
             cmd = [a.python, plot, "--sweep", "--results_root", a.results_root,
-                   "--mode", mode, "--out",
-                   os.path.join(a.results_root, f"null_concept_sweep_{mode}.png")]
+                   "--mode", mode, "--metric", a.metric, "--out",
+                   os.path.join(a.results_root, f"null_concept_sweep_{mode}_{a.metric}.png")]
             print("PLOT:", " ".join(cmd))
             subprocess.run(cmd, cwd=REPO)
 

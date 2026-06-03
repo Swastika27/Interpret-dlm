@@ -88,6 +88,7 @@ if _REPO_ROOT not in sys.path:
 sys.path.insert(0, os.path.dirname(__file__))
 
 from utils.gpu_setup import configure_cuda_performance, resolve_device_str  # noqa: E402
+from utils.assoc_metrics import compute_raw_metrics, RANK_KEY  # noqa: E402
 from concept_feature_analysis import (  # noqa: E402
     BEDIndex,
     RawNeuronSAE,
@@ -101,32 +102,17 @@ from concept_feature_analysis import (  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# Balanced F1 (vectorised; matches concept_feature_analysis exactly)
+# Metrics from circular-shift TP counts (shares utils.assoc_metrics with the
+# main analysis so observed/null values live on the same scale as the reports).
+# Under a per-window shift only TP changes; firing / n_pos / n_neg are invariant,
+# so FP = firing - TP and we recompute the full metric suite from raw counts.
 # ---------------------------------------------------------------------------
 
-def balanced_f1(
-    tp: np.ndarray,        # (..., F)  positive-token firings
-    firing: np.ndarray,    # (F,)      total firings (over all tokens)
-    n_pos: float,
-    n_neg: float,
-) -> np.ndarray:
-    """
-    Returns F1 of shape tp.shape using the same negative-rescaling as
-    compute_metrics_from_counts: FP = (firing - tp) * min(n_neg, n_pos)/n_neg.
-    """
-    n_neg_eff = min(n_neg, n_pos)
-    scale = (n_neg_eff / n_neg) if n_neg > 0 else 0.0
-    tp = tp.astype(np.float64)
-    fp = (firing.astype(np.float64) - tp) * scale
-    fn = n_pos - tp
-    denom_p = tp + fp
-    denom_r = tp + fn
-    precision = np.divide(tp, denom_p, out=np.zeros_like(tp), where=denom_p > 0)
-    recall = np.divide(tp, denom_r, out=np.zeros_like(tp), where=denom_r > 0)
-    denom_f = precision + recall
-    f1 = np.divide(2 * precision * recall, denom_f,
-                   out=np.zeros_like(precision), where=denom_f > 0)
-    return f1, precision, recall
+def metrics_from_tp(tp, firing, n_pos, n_neg):
+    """tp: (...,F); firing: (F,). Returns dict of metric arrays (same shape as tp)."""
+    tp = np.asarray(tp, dtype=np.float64)
+    neg = np.asarray(firing, dtype=np.float64) - tp
+    return compute_raw_metrics(tp, neg, n_pos, n_neg)
 
 
 def benjamini_hochberg(pvals: np.ndarray) -> np.ndarray:
@@ -310,6 +296,9 @@ def parse_args():
     p.add_argument("--all_features", action="store_true",
                    help="Test ALL dict features (slow; use --max_windows and small --n_permutations)")
     # null configuration
+    p.add_argument("--metric", default=RANK_KEY,
+                   choices=["mcc", "enrichment", "f1", "precision", "balanced_f1"],
+                   help="Metric whose null distribution is built (default: mcc).")
     p.add_argument("--n_permutations", type=int, default=200)
     p.add_argument("--null_mode", choices=["circular", "blockswap"], default="circular")
     p.add_argument("--seed", type=int, default=42)
@@ -405,7 +394,14 @@ def main():
     P = tp_null.shape[0]
     print(f"\nProcessed {acc['total_tokens']:,} tokens.")
 
-    # ---- per (concept, feature) significance ----
+    # ---- per (concept, feature) significance for the chosen metric ----
+    metric = args.metric
+
+    def _finite(a):
+        # keep comparisons/stats finite; only enrichment can be inf (capped high).
+        return np.nan_to_num(np.asarray(a, dtype=np.float64),
+                             nan=0.0, posinf=1e9, neginf=-1e9)
+
     cand_arr = np.array(cand)
     pair_rows: List[dict] = []
     summary_rows: List[dict] = []
@@ -415,18 +411,22 @@ def main():
         if n_pos == 0:
             print(f"  [skip] {cname}: no positive tokens")
             continue
-        obs_f1, obs_prec, obs_rec = balanced_f1(tp_obs[ci], firing, n_pos, n_neg)  # (nc,)
-        null_f1 = np.empty((P, len(cand)), dtype=np.float64)
+        obs_full = metrics_from_tp(tp_obs[ci], firing, n_pos, n_neg)
+        obs = _finite(obs_full[metric])                      # (nc,)
+        obs_prec = _finite(obs_full["precision"])
+        obs_rec = _finite(obs_full["recall_tpr"])
+        obs_enr = _finite(obs_full["enrichment"])
+        null = np.empty((P, len(cand)), dtype=np.float64)
         for p in range(P):
-            null_f1[p], _, _ = balanced_f1(tp_null[p, ci], firing, n_pos, n_neg)
-        null_mean = null_f1.mean(axis=0)
-        null_std = null_f1.std(axis=0)
-        null_q95 = np.quantile(null_f1, 0.95, axis=0)
-        # one-sided empirical p (with +1 smoothing) that null F1 >= observed
-        ge = (null_f1 >= obs_f1[None, :]).sum(axis=0)
+            null[p] = _finite(metrics_from_tp(tp_null[p, ci], firing, n_pos, n_neg)[metric])
+        null_mean = null.mean(axis=0)
+        null_std = null.std(axis=0)
+        null_q95 = np.quantile(null, 0.95, axis=0)
+        # one-sided empirical p (with +1 smoothing): P(null metric >= observed)
+        ge = (null >= obs[None, :]).sum(axis=0)
         pval = (1.0 + ge) / (P + 1.0)
-        z = np.divide(obs_f1 - null_mean, null_std,
-                      out=np.zeros_like(obs_f1), where=null_std > 1e-12)
+        z = np.divide(obs - null_mean, null_std,
+                      out=np.zeros_like(obs), where=null_std > 1e-12)
 
         # restrict reported rows to this concept's own candidates if available
         report_idx = list(range(len(cand)))
@@ -438,12 +438,14 @@ def main():
             pair_rows.append({
                 "concept": cname,
                 "feature_idx": int(cand_arr[j]),
-                "observed_f1": float(obs_f1[j]),
+                "metric": metric,
+                "observed": float(obs[j]),
                 "observed_precision": float(obs_prec[j]),
                 "observed_recall": float(obs_rec[j]),
-                "null_mean_f1": float(null_mean[j]),
-                "null_std_f1": float(null_std[j]),
-                "null_q95_f1": float(null_q95[j]),
+                "observed_enrichment": float(obs_enr[j]),
+                "null_mean": float(null_mean[j]),
+                "null_std": float(null_std[j]),
+                "null_q95": float(null_q95[j]),
                 "z_score": float(z[j]),
                 "p_value": float(pval[j]),
                 "n_positive_tokens": int(n_pos),
@@ -451,17 +453,19 @@ def main():
             })
 
         # selection-aware: null distribution of the MAX over candidates
-        null_max = null_f1.max(axis=1)                       # (P,)
-        best_j = int(np.argmax(obs_f1))
-        best_p = (1.0 + (null_f1[:, best_j] >= obs_f1[best_j]).sum()) / (P + 1.0)
+        null_max = null.max(axis=1)                          # (P,)
+        best_j = int(np.argmax(obs))
+        best_p = (1.0 + (null[:, best_j] >= obs[best_j]).sum()) / (P + 1.0)
         summary_rows.append({
             "concept": cname,
+            "metric": metric,
             "best_feature_idx": int(cand_arr[best_j]),
-            "observed_best_f1": float(obs_f1[best_j]),
+            "observed_best": float(obs[best_j]),
+            "observed_enrichment": float(obs_enr[best_j]),
             "p_value": float(best_p),
-            "null_max_mean_f1": float(null_max.mean()),
-            "null_max_q95_f1": float(np.quantile(null_max, 0.95)),
-            "exceeds_null_max_q95": bool(obs_f1[best_j] > np.quantile(null_max, 0.95)),
+            "null_max_mean": float(null_max.mean()),
+            "null_max_q95": float(np.quantile(null_max, 0.95)),
+            "exceeds_null_max_q95": bool(obs[best_j] > np.quantile(null_max, 0.95)),
             "n_candidates": len(cand),
             "n_positive_tokens": int(n_pos),
             "prevalence": float(n_pos / (n_pos + n_neg)),
@@ -469,12 +473,10 @@ def main():
 
     # ---- BH-FDR across all reported pairs ----
     if pair_rows:
-        pvals = np.array([r["p_value"] for r in pair_rows])
-        p_bh = benjamini_hochberg(pvals)
+        p_bh = benjamini_hochberg(np.array([r["p_value"] for r in pair_rows]))
         for r, pb in zip(pair_rows, p_bh):
             r["p_value_bh"] = float(pb)
             r["significant_bh"] = bool(pb < args.alpha)
-    # also BH the per-concept best p
     if summary_rows:
         sp = benjamini_hochberg(np.array([r["p_value"] for r in summary_rows]))
         for r, pb in zip(summary_rows, sp):
@@ -482,23 +484,24 @@ def main():
             r["significant_bh"] = bool(pb < args.alpha)
 
     # ---- write ----
-    pair_hdr = ["concept", "feature_idx", "observed_f1", "observed_precision",
-                "observed_recall", "null_mean_f1", "null_std_f1", "null_q95_f1",
-                "z_score", "p_value", "p_value_bh", "significant_bh",
+    pair_hdr = ["concept", "feature_idx", "metric", "observed", "observed_precision",
+                "observed_recall", "observed_enrichment", "null_mean", "null_std",
+                "null_q95", "z_score", "p_value", "p_value_bh", "significant_bh",
                 "n_positive_tokens", "prevalence"]
     with open(os.path.join(args.out_dir, "null_feature_pvalues.csv"), "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=pair_hdr)
         w.writeheader()
-        for r in sorted(pair_rows, key=lambda x: (x["concept"], -x["observed_f1"])):
+        for r in sorted(pair_rows, key=lambda x: (x["concept"], -x["observed"])):
             w.writerow({k: r.get(k, "") for k in pair_hdr})
 
-    sum_hdr = ["concept", "best_feature_idx", "observed_best_f1", "p_value",
-               "p_value_bh", "significant_bh", "null_max_mean_f1", "null_max_q95_f1",
-               "exceeds_null_max_q95", "n_candidates", "n_positive_tokens", "prevalence"]
+    sum_hdr = ["concept", "metric", "best_feature_idx", "observed_best",
+               "observed_enrichment", "p_value", "p_value_bh", "significant_bh",
+               "null_max_mean", "null_max_q95", "exceeds_null_max_q95",
+               "n_candidates", "n_positive_tokens", "prevalence"]
     with open(os.path.join(args.out_dir, "null_concept_summary.csv"), "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=sum_hdr)
         w.writeheader()
-        for r in sorted(summary_rows, key=lambda x: -x["observed_best_f1"]):
+        for r in sorted(summary_rows, key=lambda x: -x["observed_best"]):
             w.writerow({k: r.get(k, "") for k in sum_hdr})
 
     with open(os.path.join(args.out_dir, "null_run_meta.json"), "w") as fh:
@@ -506,6 +509,7 @@ def main():
             "sae_checkpoint": args.sae_checkpoint,
             "raw_neurons": args.raw_neurons,
             "layer": args.layer, "splits": args.splits,
+            "metric": metric,
             "null_mode": args.null_mode, "n_permutations": P, "seed": args.seed,
             "n_candidates": len(cand), "candidate_top_k": args.candidate_top_k,
             "candidates_from": args.candidates_from,
@@ -514,14 +518,14 @@ def main():
         }, fh, indent=2)
 
     # ---- console report ----
-    print(f"\n{'concept':28s} {'best_f':>4s} {'obs_F1':>7s} {'nullμ':>7s} "
-          f"{'null_q95':>8s} {'p_bh':>7s}  sig")
-    print("-" * 78)
-    for r in sorted(summary_rows, key=lambda x: -x["observed_best_f1"]):
-        print(f"{r['concept'][:28]:28s} {r['best_feature_idx']:>4d} "
-              f"{r['observed_best_f1']:>7.3f} {r['null_max_mean_f1']:>7.3f} "
-              f"{r['null_max_q95_f1']:>8.3f} {r['p_value_bh']:>7.4f}  "
-              f"{'YES' if r['significant_bh'] else 'no'}")
+    print(f"\nmetric = {metric}")
+    print(f"{'concept':28s} {'best_f':>6s} {'obs':>7s} {'null_q95':>8s} "
+          f"{'p_bh':>7s}  sig")
+    print("-" * 70)
+    for r in sorted(summary_rows, key=lambda x: -x["observed_best"]):
+        print(f"{r['concept'][:28]:28s} {r['best_feature_idx']:>6d} "
+              f"{r['observed_best']:>7.3f} {r['null_max_q95']:>8.3f} "
+              f"{r['p_value_bh']:>7.4f}  {'YES' if r['significant_bh'] else 'no'}")
     n_sig = sum(r["significant_bh"] for r in summary_rows)
     print(f"\n{n_sig}/{len(summary_rows)} concepts have a best feature significant "
           f"above the autocorrelation-preserving null (BH-FDR < {args.alpha}).")

@@ -49,7 +49,8 @@ def load_matrix(fca_root: Path):
         df = df.sort_values("feature_idx").reset_index(drop=True)
         concepts.append(cdir.name)
         f1_cols.append(df["f1"].to_numpy(dtype=np.float32))
-        prev = float(df["baseline_prevalence"].iloc[0])
+        prev_col = "prevalence" if "prevalence" in df.columns else "baseline_prevalence"
+        prev = float(df[prev_col].iloc[0])
         freq_cols.append(
             df["recall_tpr"].to_numpy(dtype=np.float32) * prev
             + df["fpr"].to_numpy(dtype=np.float32) * (1.0 - prev)

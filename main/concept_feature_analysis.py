@@ -87,6 +87,14 @@ if _REPO_ROOT not in sys.path:
 sys.path.insert(0, os.path.dirname(__file__))
 from utils.genomics_coords import infer_use_chr_from_chroms, normalize_chrom_name
 from utils.gpu_setup import configure_cuda_performance, resolve_device_str
+from utils.assoc_metrics import (
+    CANONICAL_FEATURE_COLUMNS,
+    CANONICAL_SUMMARY_COLUMNS,
+    RANK_KEY,
+    compute_raw_metrics,
+    rank_order,
+    format_value as _fmt_metric,
+)
 from SAE_training.sae import (
     BatchTopKSAE,
     TopKSAE,
@@ -487,20 +495,20 @@ def compute_metrics_from_counts(
     counts: dict,
     top_k_features: int,
     exclude_feature_indices: Optional[Set[int]] = None,
+    rank_by: str = RANK_KEY,
 ) -> List[List[dict]]:
     """
-    Derive per-concept F1 and confusion matrix from the accumulated integer
-    counts.
+    Derive per-concept association metrics from the accumulated integer counts.
 
-    Class-imbalance correction
-    --------------------------
-    Because negatives were never subsampled during streaming, the raw negative
-    counts reflect the full (imbalanced) dataset.  We correct by scaling the
-    accumulated negative counts so that the effective number of negatives equals
-    min(n_neg, n_pos) — the same balance the original per-shard subsampling
-    would have produced in expectation.
+    Metrics are computed on the RAW (un-balanced) confusion matrix via
+    utils.assoc_metrics.compute_raw_metrics — the same code path used by
+    utils/recompute_metrics.py, so the schema (CANONICAL_FEATURE_COLUMNS) is shared.
 
-    Returns a list (one entry per concept) of row-lists sorted by F1 descending.
+    Headline scalar is MCC (true zero at chance); enrichment/precision/recall/F1 are
+    reported raw, and balanced_f1 is kept for continuity only (see assoc_metrics docs).
+    Features are ranked by ``rank_by`` (default MCC) descending.
+
+    Returns a list (one entry per concept) of row-lists sorted by ``rank_by``.
     """
     n_concepts = counts["n_pos"].shape[0]
     all_rows: List[List[dict]] = []
@@ -513,57 +521,29 @@ def compute_metrics_from_counts(
             all_rows.append([])
             continue
 
-        pos_acts = counts["pos_acts"][ci].astype(np.float64)
-        neg_acts = counts["neg_acts"][ci].astype(np.float64)
+        pos_acts = counts["pos_acts"][ci]
+        neg_acts = counts["neg_acts"][ci]
+        m = compute_raw_metrics(pos_acts, neg_acts, n_pos, n_neg)
+        prevalence = n_pos / (n_pos + n_neg)
 
-        # Scale negatives down to n_pos to correct for class imbalance
-        n_neg_eff       = min(n_neg, n_pos)
-        scale           = n_neg_eff / n_neg if n_neg > 0 else 0.0
-        neg_acts_scaled = neg_acts * scale
-
-        TP = pos_acts
-        FN = n_pos      - pos_acts
-        FP = neg_acts_scaled
-        TN = n_neg_eff  - neg_acts_scaled
-
-        precision = np.divide(TP, TP + FP, out=np.zeros_like(TP), where=(TP + FP) > 0)
-        recall    = np.divide(TP, TP + FN, out=np.zeros_like(TP), where=(TP + FN) > 0)
-        f1        = np.divide(2 * precision * recall, precision + recall,
-                            out=np.zeros_like(precision), where=(precision + recall) > 0)
-
-        tpr = recall
-        tnr = np.divide(TN, TN + FP, out=np.zeros_like(TN), where=(TN + FP) > 0)
-        fpr = np.divide(FP, FP + TN, out=np.zeros_like(FP), where=(FP + TN) > 0)
-        fnr = np.divide(FN, FN + TP, out=np.zeros_like(FN), where=(FN + TP) > 0)
-
-        # Fraction of positive tokens on which each feature fires
-        baseline_prevalence = pos_acts / n_pos
-
-        order = np.argsort(f1)[::-1]
+        order = rank_order(m, key=rank_by)
         if exclude_feature_indices:
             order = np.array(
                 [fi for fi in order if int(fi) not in exclude_feature_indices],
                 dtype=np.int64,
             )
-        rows  = []
+        rows = []
         for fi in order:
             fi = int(fi)
-            rows.append({
-                "feature_idx":         fi,
-                "f1":                  float(f1[fi]),
-                "precision":           float(precision[fi]),
-                "recall_tpr":          float(tpr[fi]),
-                "tnr":                 float(tnr[fi]),
-                "fpr":                 float(fpr[fi]),
-                "fnr":                 float(fnr[fi]),
-                "tp":                  int(round(TP[fi])),
-                "tn":                  int(round(TN[fi])),
-                "fp":                  int(round(FP[fi])),
-                "fn":                  int(round(FN[fi])),
-                "n_positive_tokens":   n_pos,
-                "n_negative_tokens":   n_neg,
-                "baseline_prevalence": float(baseline_prevalence[fi]),
-            })
+            row = {
+                "feature_idx": fi,
+                "n_positive_tokens": n_pos,
+                "n_negative_tokens": n_neg,
+                "prevalence": prevalence,
+            }
+            for k, arr in m.items():
+                row[k] = arr[fi]
+            rows.append(row)
         all_rows.append(rows)
 
     return all_rows
@@ -573,13 +553,7 @@ def compute_metrics_from_counts(
 # CSV helpers
 # ---------------------------------------------------------------------------
 
-FEATURE_CSV_HEADER = [
-    "feature_idx", "f1", "precision", "recall_tpr",
-    "tnr", "fpr", "fnr",
-    "tp", "tn", "fp", "fn",
-    "n_positive_tokens", "n_negative_tokens",
-    "baseline_prevalence",
-]
+FEATURE_CSV_HEADER = list(CANONICAL_FEATURE_COLUMNS)
 
 
 def write_feature_csv(path: str, rows: List[dict]):
@@ -587,10 +561,7 @@ def write_feature_csv(path: str, rows: List[dict]):
         w = csv.DictWriter(fh, fieldnames=FEATURE_CSV_HEADER)
         w.writeheader()
         for row in rows:
-            w.writerow({
-                k: f"{row[k]:.6f}" if isinstance(row[k], float) else row[k]
-                for k in FEATURE_CSV_HEADER
-            })
+            w.writerow({k: _fmt_metric(k, row[k]) for k in FEATURE_CSV_HEADER})
 
 
 # ---------------------------------------------------------------------------
@@ -619,6 +590,12 @@ def parse_args():
     )
     p.add_argument("--batch_size",     type=int, default=2048)
     p.add_argument("--top_k_features", type=int, default=10)
+    p.add_argument(
+        "--rank_by",
+        default=RANK_KEY,
+        choices=["mcc", "enrichment", "f1", "precision", "balanced_f1"],
+        help="Metric used to rank/select the best feature per concept (default: mcc).",
+    )
     p.add_argument("--seed",           type=int, default=42)
     p.add_argument(
         "--resume",
@@ -847,28 +824,21 @@ def _cofa_read_summary_row_from_top_csv(concept_dir: str) -> Optional[dict]:
     if not rows:
         return None
     best = rows[0]
-    summary_header = [
-        "concept", "best_feature_idx", "f1", "precision", "recall_tpr",
-        "tnr", "fpr", "fnr", "tp", "tn", "fp", "fn",
-        "n_positive_tokens", "baseline_prevalence",
-    ]
     concept_name = os.path.basename(os.path.normpath(concept_dir))
     out: dict = {"concept": concept_name}
-    for k in summary_header:
+    int_cols = ("best_feature_idx", "tp", "tn", "fp", "fn",
+                "n_positive_tokens", "n_negative_tokens")
+    for k in CANONICAL_SUMMARY_COLUMNS:
         if k == "concept":
             continue
-        src = k
-        if k == "best_feature_idx":
-            src = "best_feature_idx" if "best_feature_idx" in best else "feature_idx"
+        src = "feature_idx" if k == "best_feature_idx" else k
         if src not in best:
             return None
         v = best[src]
-        if k == "best_feature_idx":
-            out[k] = int(float(v))
-        elif k in ("tp", "tn", "fp", "fn", "n_positive_tokens"):
+        if k in int_cols:
             out[k] = int(float(v))
         else:
-            out[k] = float(v)
+            out[k] = float(v)   # tolerates 'inf'/'nan' (e.g. enrichment)
     return out
 
 
@@ -1046,11 +1016,14 @@ def main():
 
     # ---- Compute metrics from accumulated counts ---------------------
     print("\nComputing metrics ...")
-    all_concept_rows = compute_metrics_from_counts(counts, args.top_k_features)
+    all_concept_rows = compute_metrics_from_counts(
+        counts, args.top_k_features, rank_by=args.rank_by
+    )
     excl_concept_rows: Optional[List[List[dict]]] = None
     if second_needed:
         excl_concept_rows = compute_metrics_from_counts(
-            counts, args.top_k_features, exclude_feature_indices=exclude_set
+            counts, args.top_k_features, exclude_feature_indices=exclude_set,
+            rank_by=args.rank_by,
         )
 
     def _write_results_tree(
@@ -1084,19 +1057,19 @@ def main():
                     local_summary.append(prev)
                 continue
 
-            print(f"\n  Top {args.top_k_features} features for '{bed.name}' ({summary_label}):")
-            print(f"  {'feat':>6}  {'F1':>6}  {'Prec':>6}  {'Rec/TPR':>8}  "
-                  f"{'TNR':>6}  {'FPR':>6}  {'FNR':>6}  "
-                  f"{'TP':>6}  {'TN':>6}  {'FP':>6}  {'FN':>6}  "
-                  f"{'BasePrevalence':>14}")
-            print("  " + "-" * 105)
+            print(f"\n  Top {args.top_k_features} features for '{bed.name}' ({summary_label}) "
+                  f"[ranked by {args.rank_by}]:")
+            print(f"  {'feat':>6}  {'MCC':>7}  {'enrich':>8}  {'Prec':>6}  "
+                  f"{'Recall':>6}  {'F1':>6}  {'balF1':>6}")
+            print("  " + "-" * 60)
             top_rows = rows[:args.top_k_features]
             for r in top_rows:
+                enr = r["enrichment"]
+                enr_s = f"{enr:8.2f}" if np.isfinite(enr) else f"{'inf':>8}"
                 print(
-                    f"  {r['feature_idx']:>6}  {r['f1']:>6.3f}  {r['precision']:>6.3f}  "
-                    f"{r['recall_tpr']:>8.3f}  {r['tnr']:>6.3f}  {r['fpr']:>6.3f}  "
-                    f"{r['fnr']:>6.3f}  {r['tp']:>6}  {r['tn']:>6}  "
-                    f"{r['fp']:>6}  {r['fn']:>6}  {r['baseline_prevalence']:>14.4f}"
+                    f"  {r['feature_idx']:>6}  {r['mcc']:>7.3f}  {enr_s}  "
+                    f"{r['precision']:>6.3f}  {r['recall_tpr']:>6.3f}  "
+                    f"{r['f1']:>6.3f}  {r['balanced_f1']:>6.3f}"
                 )
 
             os.makedirs(concept_dir, exist_ok=True)
@@ -1105,37 +1078,18 @@ def main():
             write_feature_csv(os.path.join(concept_dir, "top_features.csv"), top_rows)
 
             best = top_rows[0]
-            local_summary.append({
-                "concept":             bed.name,
-                "best_feature_idx":    best["feature_idx"],
-                "f1":                  best["f1"],
-                "precision":           best["precision"],
-                "recall_tpr":          best["recall_tpr"],
-                "tnr":                 best["tnr"],
-                "fpr":                 best["fpr"],
-                "fnr":                 best["fnr"],
-                "tp":                  best["tp"],
-                "tn":                  best["tn"],
-                "fp":                  best["fp"],
-                "fn":                  best["fn"],
-                "n_positive_tokens":   best["n_positive_tokens"],
-                "baseline_prevalence": best["baseline_prevalence"],
-            })
+            srow = {"concept": bed.name, "best_feature_idx": best["feature_idx"]}
+            for k in CANONICAL_SUMMARY_COLUMNS:
+                if k not in ("concept", "best_feature_idx"):
+                    srow[k] = best[k]
+            local_summary.append(srow)
 
         summary_path = os.path.join(out_root, "summary.csv")
-        summary_header = [
-            "concept", "best_feature_idx", "f1", "precision", "recall_tpr",
-            "tnr", "fpr", "fnr", "tp", "tn", "fp", "fn",
-            "n_positive_tokens", "baseline_prevalence",
-        ]
         with open(summary_path, "w", newline="") as fh:
-            w = csv.DictWriter(fh, fieldnames=summary_header)
+            w = csv.DictWriter(fh, fieldnames=CANONICAL_SUMMARY_COLUMNS)
             w.writeheader()
             for row in local_summary:
-                w.writerow({
-                    k: f"{row[k]:.6f}" if isinstance(row[k], float) else row[k]
-                    for k in summary_header
-                })
+                w.writerow({k: _fmt_metric(k, row[k]) for k in CANONICAL_SUMMARY_COLUMNS})
 
     # ---- Write results -----------------------------------------------
     _write_results_tree(args.out_dir, all_concept_rows, "all features")
