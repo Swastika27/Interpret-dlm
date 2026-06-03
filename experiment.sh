@@ -4,7 +4,7 @@ set -e
 
 seq_len=512
 seq_per_shard=1024
-layer=6
+layer=8
 
 N_TRAIN=800000
 N_TEST=80000
@@ -215,6 +215,10 @@ PY
       --high_mse_top_k 20
   fi
 
+  echo "Finding top 50 activating tokens for each feature"
+  if [ -f "results/$result_tag/top_activations/top_activations.csv" ]; then
+    echo "Already exists. Skipping...."
+  else
   python main/find_top_activations.py \
     --sae_checkpoint  ${CHECKPOINT_DIR}/step_${ckpt_step}.pt \
     --sae_cfg         trained_models/$model_basename/config.json \
@@ -227,13 +231,18 @@ PY
     --batch_size      2048 \
     --num_workers     4 \
     --resume
+  fi
 
   echo "Anotating top activations with overlapping concepts" 
+  if [ -f "results/$result_tag/activation_concept_assoc/venn.csv" ]; then
+    echo "Already exists. Skipping...."
+  else
   python main/annotate_top_activations.py \
     --top_activations  results/$result_tag/top_activations/top_activations.pt \
     --bed_dir          all_annotations \
     --out_dir          results/$result_tag/activation_concept_assoc \
     --resume
+  fi
 
   echo "running concept -> feature analysis for $result_tag"
   if [ -f "results/$result_tag/feature_concept_analysis/summary.csv" ]; then
