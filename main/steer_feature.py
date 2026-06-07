@@ -249,24 +249,28 @@ def select_windows(concept_bed: BEDIndex, rows, use_chr_positions, n_seq) -> Lis
 
 
 @torch.no_grad()
-def steer_features(target: dict, model, tokenizer, sae, genome, rows, concept_bed,
-                   factors: List[float], device: str, seq_len: int, steer_mode: str,
-                   features: List[int], role: str = "target") -> List[dict]:
-    """Scale a SET of features simultaneously along their decoder directions.
+def steer_multi(target: dict, model, tokenizer, sae, genome, rows, concept_bed,
+                factors: List[float], device: str, seq_len: int, steer_mode: str,
+                role_features: "dict") -> List[dict]:
+    """Steer several feature SETS (roles) over the same windows, computing the baseline
+    forward pass + SAE encode + concept labels ONCE per window and sharing them across
+    every role. role_features is an ordered {role: [feature_idx, ...]} dict (a single
+    feature is just a one-element list); only the per-role patched passes are unique.
 
-    A single-feature steer is just features=[f]; a group ablation passes every
-    concept-associated feature so factor 0 removes the whole concept representation.
-    The decoder_add delta is the summed contribution of the group:
-        delta[t,:] = (k - 1) * x_std[t] * (a_g[t,:] @ W_dec[group])
+    Each role's decoder_add delta is the summed contribution of its feature set:
+        delta[t,:] = (k - 1) * x_std[t] * (a_g[t,:] @ W_dec[role_feats])
+    Output rows are identical to steering each role independently.
     """
-    feats = torch.tensor(sorted(set(int(i) for i in features)), dtype=torch.long, device=device)
+    roles = [(r, torch.tensor(sorted(set(int(i) for i in fl)), dtype=torch.long, device=device))
+             for r, fl in role_features.items() if len(fl) > 0]
+    if not roles:
+        return []
     li = target["layer_idx"]
-    w_dec_g = sae.W_dec[feats].detach().to(device).float()    # [G, D]
-    # accumulators: factor -> sums
-    acc = {k: {"ce_all": 0.0, "n_all": 0, "ce_act": 0.0, "n_act": 0,
-               "ce_con": 0.0, "n_con": 0} for k in factors}
+    w_dec = {r: sae.W_dec[feats].detach().to(device).float() for r, feats in roles}  # [G,D]
+    acc = {r: {k: {"ce_all": 0.0, "n_all": 0, "ce_act": 0.0, "n_act": 0,
+                   "ce_con": 0.0, "n_con": 0} for k in factors} for r, _ in roles}
+    total_active = {r: 0 for r, _ in roles}
     n_seq_used = 0
-    total_active = 0
 
     for (chrom, start, end) in rows:
         seq = fetch_batch(genome, [(chrom, start, end)])[0]
@@ -278,71 +282,72 @@ def steer_features(target: dict, model, tokenizer, sae, genome, rows, concept_be
         if L != seq_len:
             continue
 
-        # baseline pass: capture hidden + logits
+        # ---- shared per-window work (computed ONCE, reused by every role) ----
         logits0, hidden = run_hyenadna_with_patch(model, tokens, li, patch_tensor=None, device=device)
         ce0 = per_position_ce(logits0, tokens[0])             # [L-1]
-
-        # SAE acts + per-token std (input_unit_norm path)
         h_flat = hidden.squeeze(0).to(device).float()         # [L, D]
         _, acts = sae(h_flat)                                 # [L, dict]
-        a_g = acts[:, feats].float()                          # [L, G]
         x_std = h_flat.std(dim=-1, keepdim=True)              # [L, 1]
-        active = (a_g > 0).any(dim=-1)                        # [L] any group feature fires
-        total_active += int(active.sum().item())
-
-        # concept label per token (token i -> base start+i for 1bp/token tokenisation)
+        x_mean = h_flat.mean(dim=-1, keepdim=True)            # [L, 1] (full_recon denorm)
         pos = np.arange(start, start + L, dtype=np.int64)
         con = torch.from_numpy(concept_bed.contains_batch(chrom, pos)).to(device)  # [L] bool
-
-        # masks aligned to CE positions (predict t+1 from t) -> use [:-1]
-        m_act = active[:-1].cpu()
-        m_con = con[:-1].cpu()
+        m_con = con[:-1].cpu()                                # concept mask (shared)
         n_seq_used += 1
 
-        for k in factors:
-            if k == 1.0:
-                ce = ce0                                      # identity control
-            else:
-                if steer_mode == "decoder_add":
-                    delta = (k - 1.0) * x_std * (a_g @ w_dec_g)   # [L,D]
-                    patched = (h_flat + delta).unsqueeze(0)
-                elif steer_mode == "full_recon":
-                    recon, acts2 = sae(h_flat)
-                    acts2 = acts2.clone(); acts2[:, feats] = k * a_g
-                    patched = (acts2 @ sae.W_dec + sae.b_dec)
-                    patched = (patched * x_std + h_flat.mean(dim=-1, keepdim=True)).unsqueeze(0)
+        # ---- per-role patched passes (unique) ----
+        for r, feats in roles:
+            a_g = acts[:, feats].float()                      # [L, G]
+            active = (a_g > 0).any(dim=-1)                    # [L] any role feature fires
+            total_active[r] += int(active.sum().item())
+            m_act = active[:-1].cpu()
+            acr = acc[r]
+            for k in factors:
+                if k == 1.0:
+                    ce = ce0                                  # identity control (shared baseline)
                 else:
-                    raise ValueError(steer_mode)
-                logits, _ = run_hyenadna_with_patch(model, tokens, li,
-                                                    patch_tensor=patched.to(device), device=device)
-                ce = per_position_ce(logits, tokens[0])
-            acc[k]["ce_all"] += float(ce.sum()); acc[k]["n_all"] += ce.numel()
-            if m_act.any():
-                acc[k]["ce_act"] += float(ce[m_act].sum()); acc[k]["n_act"] += int(m_act.sum())
-            if m_con.any():
-                acc[k]["ce_con"] += float(ce[m_con].sum()); acc[k]["n_con"] += int(m_con.sum())
+                    if steer_mode == "decoder_add":
+                        delta = (k - 1.0) * x_std * (a_g @ w_dec[r])   # [L,D]
+                        patched = (h_flat + delta).unsqueeze(0)
+                    elif steer_mode == "full_recon":
+                        acts2 = acts.clone(); acts2[:, feats] = k * a_g
+                        patched = (acts2 @ sae.W_dec + sae.b_dec)
+                        patched = (patched * x_std + x_mean).unsqueeze(0)
+                    else:
+                        raise ValueError(steer_mode)
+                    logits, _ = run_hyenadna_with_patch(model, tokens, li,
+                                                        patch_tensor=patched.to(device), device=device)
+                    ce = per_position_ce(logits, tokens[0])
+                acr[k]["ce_all"] += float(ce.sum()); acr[k]["n_all"] += ce.numel()
+                if m_act.any():
+                    acr[k]["ce_act"] += float(ce[m_act].sum()); acr[k]["n_act"] += int(m_act.sum())
+                if m_con.any():
+                    acr[k]["ce_con"] += float(ce[m_con].sum()); acr[k]["n_con"] += int(m_con.sum())
 
-    # build rows + deltas vs factor 1 (baseline)
-    def mean(d, s, n):
-        return acc[d][s] / acc[d][n] if acc[d][n] else float("nan")
-    base = {s: mean(1.0, f"ce_{s}", f"n_{s}") for s in ("all", "act", "con")}
-    g = len(feats)
-    fid = int(feats[0]) if g == 1 else -1                     # -1 = group sentinel
+    # ---- build rows + deltas vs factor 1 (baseline), per role ----
     out = []
-    for k in factors:
-        row = {
-            "concept": target["concept"], "layer": target["layer"], "feature_idx": fid,
-            "n_group_features": g,
-            "role": role, "steer_mode": steer_mode, "factor": k, "n_seq": n_seq_used,
-            "n_active_tokens": total_active,
-            "ce_all": mean(k, "ce_all", "n_all"),
-            "ce_active": mean(k, "ce_act", "n_act"),
-            "ce_concept": mean(k, "ce_con", "n_con"),
-        }
-        row["dCE_all"] = row["ce_all"] - base["all"]
-        row["dCE_active"] = row["ce_active"] - base["act"]
-        row["dCE_concept"] = row["ce_concept"] - base["con"]
-        out.append(row)
+    for r, feats in roles:
+        acr = acc[r]
+
+        def mean(d, s, n, _acr=acr):
+            return _acr[d][s] / _acr[d][n] if _acr[d][n] else float("nan")
+
+        base = {s: mean(1.0, f"ce_{s}", f"n_{s}") for s in ("all", "act", "con")}
+        g = len(feats)
+        fid = int(feats[0]) if g == 1 else -1                 # -1 = group sentinel
+        for k in factors:
+            row = {
+                "concept": target["concept"], "layer": target["layer"], "feature_idx": fid,
+                "n_group_features": g,
+                "role": r, "steer_mode": steer_mode, "factor": k, "n_seq": n_seq_used,
+                "n_active_tokens": total_active[r],
+                "ce_all": mean(k, "ce_all", "n_all"),
+                "ce_active": mean(k, "ce_act", "n_act"),
+                "ce_concept": mean(k, "ce_con", "n_con"),
+            }
+            row["dCE_all"] = row["ce_all"] - base["all"]
+            row["dCE_active"] = row["ce_active"] - base["act"]
+            row["dCE_concept"] = row["ce_concept"] - base["con"]
+            out.append(row)
     return out
 
 
@@ -380,6 +385,14 @@ def parse_args():
 
 
 def main():
+    # Force line-buffered stdout so progress prints show up even when the output is
+    # piped/redirected/backgrounded (otherwise Python block-buffers a non-TTY stdout
+    # and the job looks "hung" while it is actually running).
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     a = parse_args()
     a.device = resolve_device_str(a.device)
     configure_cuda_performance()
@@ -412,43 +425,25 @@ def main():
         rows = [rows_all[i] for i in keep]
         print(f"  {len(rows)} windows overlap the concept; steering factors {a.factors}")
 
-        def _log(res, fields=("all", "active", "concept")):
-            for r in res:
-                parts = []
-                for s in fields:
-                    ce = r["ce_" + s]
-                    dce = r["dCE_" + s]
-                    parts.append("CE_%s=%.4f (d%+.4f)" % (s, ce, dce))
-                print(f"   factor {r['factor']:>5}: " + "  ".join(parts))
-
-        res = steer_features(t, model, tok, sae, genome, rows, bed,
-                             a.factors, a.device, a.seq_len, a.steer_mode,
-                             features=[t["feature"]], role="target")
-        _log(res)
-        all_rows.extend(res)
+        # ---- build the role -> feature-set map (selection only; no GPU yet) ----
+        role_features = {"target": [t["feature"]]}
 
         # negative baseline: matched-magnitude, concept-agnostic control feature
         cf = None
         if str(a.control_feature).lower() not in ("off", "none", ""):
-            if str(a.control_feature).lower() == "auto":
-                cf = pick_control_feature(t, a.results_root, a.sae_subdir, a.control_mcc_max)
-            else:
-                cf = int(a.control_feature)
-        if cf is None:
-            if str(a.control_feature).lower() not in ("off", "none", ""):
+            cf = (pick_control_feature(t, a.results_root, a.sae_subdir, a.control_mcc_max)
+                  if str(a.control_feature).lower() == "auto" else int(a.control_feature))
+            if cf is None:
                 print("  [control] no matched concept-agnostic feature found; skipping baseline")
-        elif cf == t["feature"]:
-            print("  [control] matched control == target feature; skipping baseline")
-        else:
-            print(f"  [control] negative baseline: control feat {cf} "
-                  f"(concept-agnostic, |MCC|<={a.control_mcc_max}, rate-matched)")
-            cres = steer_features(t, model, tok, sae, genome, rows, bed,
-                                  a.factors, a.device, a.seq_len, a.steer_mode,
-                                  features=[cf], role="control")
-            _log(cres, fields=("active", "concept"))
-            all_rows.extend(cres)
+            elif cf == t["feature"]:
+                print("  [control] matched control == target feature; skipping baseline")
+            else:
+                print(f"  [control] negative baseline: control feat {cf} "
+                      f"(concept-agnostic, |MCC|<={a.control_mcc_max}, rate-matched)")
+                role_features["control"] = [cf]
 
         # group ablation: every concept feature (MCC >= threshold) ablated together
+        grp = []
         if a.group == "auto":
             grp = select_concept_features(t, a.results_root, a.sae_subdir, a.group_mcc_threshold)
             if not grp:
@@ -456,27 +451,32 @@ def main():
             else:
                 print(f"  [group] ablating {len(grp)} concept features "
                       f"(MCC >= {a.group_mcc_threshold}) together")
-                gres = steer_features(t, model, tok, sae, genome, rows, bed,
-                                      a.factors, a.device, a.seq_len, a.steer_mode,
-                                      features=grp, role="group")
-                _log(gres)
-                all_rows.extend(gres)
+                role_features["group"] = grp
 
-                # negative baseline for the group: size- + rate-matched concept-agnostic group
-                if a.group_control == "auto":
-                    rgrp = select_random_group(t, a.results_root, a.sae_subdir, grp,
-                                               a.control_mcc_max)
-                    if not rgrp:
-                        print(f"  [group_control] candidate pool too small to match "
-                              f"{len(grp)} features; skipping")
-                    else:
-                        print(f"  [group_control] ablating {len(rgrp)} matched "
-                              f"concept-agnostic features (|MCC|<={a.control_mcc_max})")
-                        gcres = steer_features(t, model, tok, sae, genome, rows, bed,
-                                               a.factors, a.device, a.seq_len, a.steer_mode,
-                                               features=rgrp, role="group_control")
-                        _log(gcres)
-                        all_rows.extend(gcres)
+        # negative baseline for the group: size- + rate-matched concept-agnostic group
+        if grp and a.group_control == "auto":
+            rgrp = select_random_group(t, a.results_root, a.sae_subdir, grp, a.control_mcc_max)
+            if not rgrp:
+                print(f"  [group_control] candidate pool too small to match "
+                      f"{len(grp)} features; skipping")
+            else:
+                print(f"  [group_control] ablating {len(rgrp)} matched "
+                      f"concept-agnostic features (|MCC|<={a.control_mcc_max})")
+                role_features["group_control"] = rgrp
+
+        # ---- single steering pass: baseline + SAE encode shared across all roles ----
+        res = steer_multi(t, model, tok, sae, genome, rows, bed,
+                          a.factors, a.device, a.seq_len, a.steer_mode, role_features)
+        by_role = {}
+        for row in res:
+            by_role.setdefault(row["role"], []).append(row)
+        for role in role_features:
+            fields = ("active", "concept") if role == "control" else ("all", "active", "concept")
+            print(f"  -- {role} --")
+            for r in sorted(by_role.get(role, []), key=lambda x: x["factor"]):
+                parts = ["CE_%s=%.4f (d%+.4f)" % (s, r["ce_" + s], r["dCE_" + s]) for s in fields]
+                print(f"   factor {r['factor']:>5}: " + "  ".join(parts))
+        all_rows.extend(res)
 
     # write CSV
     hdr = ["concept", "layer", "feature_idx", "n_group_features", "role", "steer_mode",
