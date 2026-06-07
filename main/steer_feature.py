@@ -40,6 +40,17 @@ target's, so the steering delta has comparable magnitude. With --control_feature
 fix it, or "off" to skip. A good result: the control's dCE stays near zero while the
 target's grows — the effect tracks the feature's meaning, not the size of the poke.
 
+Group ablation (--group)
+------------------------
+A single feature is often a redundant copy of distributed concept information, so
+ablating it alone underestimates the concept's causal role. With --group auto (default)
+we ALSO ablate, simultaneously, EVERY feature positively associated with the concept
+(MCC >= --group_mcc_threshold) — removing the whole concept representation at once. If
+even the group ablation leaves next-token CE unchanged, the concept is genuinely not
+load-bearing for prediction (decodable but not used); if the group hurts where single
+features did not, the signal was real but redundant. Group rows have role="group",
+feature_idx=-1, and n_group_features = size of the set.
+
 Example
 -------
   python main/steer_feature.py \
@@ -160,6 +171,24 @@ def pick_control_feature(target: dict, results_root: str, sae_subdir: str,
     return cands[0][1]
 
 
+def select_concept_features(target: dict, results_root: str, sae_subdir: str,
+                            mcc_threshold: float) -> List[int]:
+    """All features positively associated with the concept (MCC >= threshold), from the
+    concept's all_features.csv — the set to ablate together for group ablation."""
+    af = os.path.join(results_root, target["tag"], f"step{target['step']}",
+                      sae_subdir, target["concept"], "all_features.csv")
+    if not os.path.isfile(af):
+        return []
+    feats = []
+    for r in csv.DictReader(open(af, newline="")):
+        try:
+            if float(r["mcc"]) >= mcc_threshold:
+                feats.append(int(float(r["feature_idx"])))
+        except (ValueError, KeyError):
+            continue
+    return sorted(set(feats))
+
+
 def select_windows(concept_bed: BEDIndex, rows, use_chr_positions, n_seq) -> List[int]:
     """Indices of BED windows whose span overlaps the concept (so the feature can fire)."""
     keep = []
@@ -174,12 +203,19 @@ def select_windows(concept_bed: BEDIndex, rows, use_chr_positions, n_seq) -> Lis
 
 
 @torch.no_grad()
-def steer_one(target: dict, model, tokenizer, sae, genome, rows, concept_bed,
-              factors: List[float], device: str, seq_len: int, steer_mode: str,
-              feature: Optional[int] = None, role: str = "target") -> List[dict]:
-    f = target["feature"] if feature is None else feature
+def steer_features(target: dict, model, tokenizer, sae, genome, rows, concept_bed,
+                   factors: List[float], device: str, seq_len: int, steer_mode: str,
+                   features: List[int], role: str = "target") -> List[dict]:
+    """Scale a SET of features simultaneously along their decoder directions.
+
+    A single-feature steer is just features=[f]; a group ablation passes every
+    concept-associated feature so factor 0 removes the whole concept representation.
+    The decoder_add delta is the summed contribution of the group:
+        delta[t,:] = (k - 1) * x_std[t] * (a_g[t,:] @ W_dec[group])
+    """
+    feats = torch.tensor(sorted(set(int(i) for i in features)), dtype=torch.long, device=device)
     li = target["layer_idx"]
-    w_dec_f = sae.W_dec[f].detach().to(device).float()        # [D]
+    w_dec_g = sae.W_dec[feats].detach().to(device).float()    # [G, D]
     # accumulators: factor -> sums
     acc = {k: {"ce_all": 0.0, "n_all": 0, "ce_act": 0.0, "n_act": 0,
                "ce_con": 0.0, "n_con": 0} for k in factors}
@@ -203,9 +239,9 @@ def steer_one(target: dict, model, tokenizer, sae, genome, rows, concept_bed,
         # SAE acts + per-token std (input_unit_norm path)
         h_flat = hidden.squeeze(0).to(device).float()         # [L, D]
         _, acts = sae(h_flat)                                 # [L, dict]
-        a_f = acts[:, f].float()                              # [L]
+        a_g = acts[:, feats].float()                          # [L, G]
         x_std = h_flat.std(dim=-1, keepdim=True)              # [L, 1]
-        active = (a_f > 0)                                    # [L]
+        active = (a_g > 0).any(dim=-1)                        # [L] any group feature fires
         total_active += int(active.sum().item())
 
         # concept label per token (token i -> base start+i for 1bp/token tokenisation)
@@ -222,11 +258,11 @@ def steer_one(target: dict, model, tokenizer, sae, genome, rows, concept_bed,
                 ce = ce0                                      # identity control
             else:
                 if steer_mode == "decoder_add":
-                    delta = ((k - 1.0) * a_f).unsqueeze(-1) * x_std * w_dec_f.unsqueeze(0)  # [L,D]
+                    delta = (k - 1.0) * x_std * (a_g @ w_dec_g)   # [L,D]
                     patched = (h_flat + delta).unsqueeze(0)
                 elif steer_mode == "full_recon":
                     recon, acts2 = sae(h_flat)
-                    acts2 = acts2.clone(); acts2[:, f] = k * a_f
+                    acts2 = acts2.clone(); acts2[:, feats] = k * a_g
                     patched = (acts2 @ sae.W_dec + sae.b_dec)
                     patched = (patched * x_std + h_flat.mean(dim=-1, keepdim=True)).unsqueeze(0)
                 else:
@@ -244,10 +280,13 @@ def steer_one(target: dict, model, tokenizer, sae, genome, rows, concept_bed,
     def mean(d, s, n):
         return acc[d][s] / acc[d][n] if acc[d][n] else float("nan")
     base = {s: mean(1.0, f"ce_{s}", f"n_{s}") for s in ("all", "act", "con")}
+    g = len(feats)
+    fid = int(feats[0]) if g == 1 else -1                     # -1 = group sentinel
     out = []
     for k in factors:
         row = {
-            "concept": target["concept"], "layer": target["layer"], "feature_idx": f,
+            "concept": target["concept"], "layer": target["layer"], "feature_idx": fid,
+            "n_group_features": g,
             "role": role, "steer_mode": steer_mode, "factor": k, "n_seq": n_seq_used,
             "n_active_tokens": total_active,
             "ce_all": mean(k, "ce_all", "n_all"),
@@ -283,6 +322,10 @@ def parse_args():
                         "an int feature idx, or 'off'")
     p.add_argument("--control_mcc_max", type=float, default=0.02,
                    help="Max |MCC| for an auto-selected control feature (concept-agnostic)")
+    p.add_argument("--group", default="auto", choices=["auto", "off"],
+                   help="Group-ablate all concept features (MCC >= --group_mcc_threshold)")
+    p.add_argument("--group_mcc_threshold", type=float, default=0.10,
+                   help="MCC threshold defining the concept feature group")
     p.add_argument("--device", default=None)
     p.add_argument("--out_dir", default=os.path.join(_REPO, "results", "analysis", "steering"))
     return p.parse_args()
@@ -320,12 +363,20 @@ def main():
             continue
         rows = [rows_all[i] for i in keep]
         print(f"  {len(rows)} windows overlap the concept; steering factors {a.factors}")
-        res = steer_one(t, model, tok, sae, genome, rows, bed,
-                        a.factors, a.device, a.seq_len, a.steer_mode)
-        for r in res:
-            print(f"   factor {r['factor']:>5}: CE_all={r['ce_all']:.4f} (d{r['dCE_all']:+.4f})  "
-                  f"CE_active={r['ce_active']:.4f} (d{r['dCE_active']:+.4f})  "
-                  f"CE_concept={r['ce_concept']:.4f} (d{r['dCE_concept']:+.4f})")
+
+        def _log(res, fields=("all", "active", "concept")):
+            for r in res:
+                parts = []
+                for s in fields:
+                    ce = r["ce_" + s]
+                    dce = r["dCE_" + s]
+                    parts.append("CE_%s=%.4f (d%+.4f)" % (s, ce, dce))
+                print(f"   factor {r['factor']:>5}: " + "  ".join(parts))
+
+        res = steer_features(t, model, tok, sae, genome, rows, bed,
+                             a.factors, a.device, a.seq_len, a.steer_mode,
+                             features=[t["feature"]], role="target")
+        _log(res)
         all_rows.extend(res)
 
         # negative baseline: matched-magnitude, concept-agnostic control feature
@@ -343,18 +394,29 @@ def main():
         else:
             print(f"  [control] negative baseline: control feat {cf} "
                   f"(concept-agnostic, |MCC|<={a.control_mcc_max}, rate-matched)")
-            cres = steer_one(t, model, tok, sae, genome, rows, bed,
-                             a.factors, a.device, a.seq_len, a.steer_mode,
-                             feature=cf, role="control")
-            for r in cres:
-                print(f"   factor {r['factor']:>5}: CE_active={r['ce_active']:.4f} "
-                      f"(d{r['dCE_active']:+.4f})  CE_concept={r['ce_concept']:.4f} "
-                      f"(d{r['dCE_concept']:+.4f})")
+            cres = steer_features(t, model, tok, sae, genome, rows, bed,
+                                  a.factors, a.device, a.seq_len, a.steer_mode,
+                                  features=[cf], role="control")
+            _log(cres, fields=("active", "concept"))
             all_rows.extend(cres)
 
+        # group ablation: every concept feature (MCC >= threshold) ablated together
+        if a.group == "auto":
+            grp = select_concept_features(t, a.results_root, a.sae_subdir, a.group_mcc_threshold)
+            if not grp:
+                print(f"  [group] no features with MCC >= {a.group_mcc_threshold}; skipping")
+            else:
+                print(f"  [group] ablating {len(grp)} concept features "
+                      f"(MCC >= {a.group_mcc_threshold}) together")
+                gres = steer_features(t, model, tok, sae, genome, rows, bed,
+                                      a.factors, a.device, a.seq_len, a.steer_mode,
+                                      features=grp, role="group")
+                _log(gres)
+                all_rows.extend(gres)
+
     # write CSV
-    hdr = ["concept", "layer", "feature_idx", "role", "steer_mode", "factor", "n_seq",
-           "n_active_tokens", "ce_all", "ce_active", "ce_concept",
+    hdr = ["concept", "layer", "feature_idx", "n_group_features", "role", "steer_mode",
+           "factor", "n_seq", "n_active_tokens", "ce_all", "ce_active", "ce_concept",
            "dCE_all", "dCE_active", "dCE_concept"]
     out_csv = os.path.join(a.out_dir, "steering_results.csv")
     with open(out_csv, "w", newline="") as fh:
@@ -377,31 +439,34 @@ def main():
         for j, (c, L) in enumerate(panels):
             ax = axes[0][j]
             fx = None
-            feats = {}
-            for role, ls, mk in [("target", "-", "o"), ("control", "--", "x")]:
+            info = {}
+            for role, ls, mk in [("target", "-", "o"), ("control", "--", "x"),
+                                 ("group", ":", "s")]:
                 rr = sorted([r for r in all_rows if r["concept"] == c and r["layer"] == L
                              and r.get("role", "target") == role], key=lambda x: x["factor"])
                 if not rr:
                     continue
-                feats[role] = rr[0]["feature_idx"]
+                info[role] = (rr[0]["feature_idx"], rr[0].get("n_group_features", 1))
                 fx = [r["factor"] for r in rr]
                 for col, lab, color in series:
                     ax.plot(range(len(fx)), [r[col] for r in rr], marker=mk, ls=ls,
-                            color=color, alpha=0.6 if role == "control" else 1.0,
+                            color=color, alpha=0.55 if role != "target" else 1.0,
                             label=f"{lab} ({role})")
             if fx is None:
                 ax.axis("off"); continue
             ax.set_xticks(range(len(fx))); ax.set_xticklabels([f"{v:g}x" for v in fx])
-            ttl = f"{c}\nL{L} feat {feats.get('target', '?')}"
-            if "control" in feats:
-                ttl += f"  (ctrl {feats['control']})"
+            ttl = f"{c}\nL{L} feat {info.get('target', ('?',))[0]}"
+            if "control" in info:
+                ttl += f"  ctrl {info['control'][0]}"
+            if "group" in info:
+                ttl += f"  grp n={info['group'][1]}"
             ax.set_title(ttl, fontsize=9)
             ax.set_xlabel("steering factor"); ax.set_ylabel("mean next-token CE")
             ax.grid(ls=":", alpha=0.5)
             if j == 0:
-                ax.legend(fontsize=7, ncol=2)
+                ax.legend(fontsize=6, ncol=3)
         fig.suptitle("Causal feature steering — next-token CE vs activation scaling "
-                     "(solid = target, dashed = control)", fontsize=11)
+                     "(solid=target, dashed=control, dotted=group ablation)", fontsize=10)
         fig.tight_layout(rect=(0, 0, 1, 0.95))
         out_png = os.path.join(a.out_dir, "steering_ce.png")
         fig.savefig(out_png, dpi=150)
