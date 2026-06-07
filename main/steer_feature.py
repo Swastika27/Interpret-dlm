@@ -51,6 +51,10 @@ load-bearing for prediction (decodable but not used); if the group hurts where s
 features did not, the signal was real but redundant. Group rows have role="group",
 feature_idx=-1, and n_group_features = size of the set.
 
+A size- and firing-rate-matched concept-AGNOSTIC control group (role="group_control",
+--group_control auto) is ablated alongside it: if the real group hurts while this matched
+random group does not, the effect is concept-specific and not just "ablating N features".
+
 Example
 -------
   python main/steer_feature.py \
@@ -187,6 +191,48 @@ def select_concept_features(target: dict, results_root: str, sae_subdir: str,
         except (ValueError, KeyError):
             continue
     return sorted(set(feats))
+
+
+def select_random_group(target: dict, results_root: str, sae_subdir: str,
+                        group_feats: List[int], mcc_max: float = 0.02) -> List[int]:
+    """Size- AND rate-matched concept-AGNOSTIC control group (negative baseline for the
+    group ablation). For each high-MCC group feature we greedily pick the nearest-firing-
+    rate feature with |MCC| <= mcc_max (without replacement), so the control group has the
+    same size and matched firing-rate distribution but carries no concept signal.
+
+    Deterministic (greedy nearest-rate, no RNG). Returns [] if the candidate pool is too
+    small to match the group size."""
+    af = os.path.join(results_root, target["tag"], f"step{target['step']}",
+                      sae_subdir, target["concept"], "all_features.csv")
+    if not os.path.isfile(af) or not group_feats:
+        return []
+    rate_by, mcc_by = {}, {}
+    for r in csv.DictReader(open(af, newline="")):
+        try:
+            fi = int(float(r["feature_idx"]))
+            denom = float(r["n_positive_tokens"]) + float(r["n_negative_tokens"])
+            rate_by[fi] = (float(r["tp"]) + float(r["fp"])) / denom if denom else 0.0
+            mcc_by[fi] = float(r["mcc"])
+        except (ValueError, KeyError):
+            continue
+    group_set = set(group_feats)
+    pool = [fi for fi, m in mcc_by.items()
+            if abs(m) <= mcc_max and fi not in group_set and rate_by.get(fi, 0.0) > 0.0]
+    if len(pool) < len(group_feats):
+        return []
+    used, chosen = set(), []
+    for gf in group_feats:
+        tr = rate_by.get(gf, 0.0)
+        best, bestd = None, float("inf")
+        for fi in pool:
+            if fi in used:
+                continue
+            d = abs(rate_by[fi] - tr)
+            if d < bestd:
+                bestd, best = d, fi
+        if best is not None:
+            used.add(best); chosen.append(best)
+    return sorted(chosen)
 
 
 def select_windows(concept_bed: BEDIndex, rows, use_chr_positions, n_seq) -> List[int]:
@@ -326,6 +372,8 @@ def parse_args():
                    help="Group-ablate all concept features (MCC >= --group_mcc_threshold)")
     p.add_argument("--group_mcc_threshold", type=float, default=0.10,
                    help="MCC threshold defining the concept feature group")
+    p.add_argument("--group_control", default="auto", choices=["auto", "off"],
+                   help="Also ablate a size- and rate-matched concept-agnostic random group")
     p.add_argument("--device", default=None)
     p.add_argument("--out_dir", default=os.path.join(_REPO, "results", "analysis", "steering"))
     return p.parse_args()
@@ -414,6 +462,22 @@ def main():
                 _log(gres)
                 all_rows.extend(gres)
 
+                # negative baseline for the group: size- + rate-matched concept-agnostic group
+                if a.group_control == "auto":
+                    rgrp = select_random_group(t, a.results_root, a.sae_subdir, grp,
+                                               a.control_mcc_max)
+                    if not rgrp:
+                        print(f"  [group_control] candidate pool too small to match "
+                              f"{len(grp)} features; skipping")
+                    else:
+                        print(f"  [group_control] ablating {len(rgrp)} matched "
+                              f"concept-agnostic features (|MCC|<={a.control_mcc_max})")
+                        gcres = steer_features(t, model, tok, sae, genome, rows, bed,
+                                               a.factors, a.device, a.seq_len, a.steer_mode,
+                                               features=rgrp, role="group_control")
+                        _log(gcres)
+                        all_rows.extend(gcres)
+
     # write CSV
     hdr = ["concept", "layer", "feature_idx", "n_group_features", "role", "steer_mode",
            "factor", "n_seq", "n_active_tokens", "ce_all", "ce_active", "ce_concept",
@@ -425,49 +489,55 @@ def main():
             w.writerow({k: (f"{r[k]:.6f}" if isinstance(r[k], float) else r[k]) for k in hdr})
     print(f"\nWrote {out_csv}")
 
-    # figure: CE vs factor per target, at active/concept/all positions
+    # figure: dCE (change vs identity) per role, at concept & active positions
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         panels = sorted({(r["concept"], r["layer"]) for r in all_rows})
-        series = [("ce_active", "active", "tab:red"),
-                  ("ce_concept", "concept", "tab:purple"),
-                  ("ce_all", "all", "tab:blue")]
-        fig, axes = plt.subplots(1, len(panels), figsize=(5.2 * len(panels), 4.4),
+        # role -> (label, colour, marker, linestyle)
+        ROLE_STYLE = {
+            "target":        ("target (1 feat)",       "tab:red",   "o", "-"),
+            "control":       ("control (1 feat)",      "tab:gray",  "x", "--"),
+            "group":         ("group (concept)",       "tab:blue",  "s", "-"),
+            "group_control": ("group control (random)","tab:cyan",  "^", "--"),
+        }
+        posset = [("dCE_concept", "concept positions"), ("dCE_active", "active positions")]
+        fig, axes = plt.subplots(len(posset), len(panels),
+                                 figsize=(5.2 * len(panels), 3.6 * len(posset)),
                                  squeeze=False)
         for j, (c, L) in enumerate(panels):
-            ax = axes[0][j]
-            fx = None
             info = {}
-            for role, ls, mk in [("target", "-", "o"), ("control", "--", "x"),
-                                 ("group", ":", "s")]:
-                rr = sorted([r for r in all_rows if r["concept"] == c and r["layer"] == L
-                             and r.get("role", "target") == role], key=lambda x: x["factor"])
-                if not rr:
-                    continue
-                info[role] = (rr[0]["feature_idx"], rr[0].get("n_group_features", 1))
-                fx = [r["factor"] for r in rr]
-                for col, lab, color in series:
+            fx = None
+            for i, (col, ptitle) in enumerate(posset):
+                ax = axes[i][j]
+                for role, (lab, color, mk, ls) in ROLE_STYLE.items():
+                    rr = sorted([r for r in all_rows if r["concept"] == c and r["layer"] == L
+                                 and r.get("role", "target") == role],
+                                key=lambda x: x["factor"])
+                    if not rr:
+                        continue
+                    info[role] = (rr[0]["feature_idx"], rr[0].get("n_group_features", 1))
+                    fx = [r["factor"] for r in rr]
                     ax.plot(range(len(fx)), [r[col] for r in rr], marker=mk, ls=ls,
-                            color=color, alpha=0.55 if role != "target" else 1.0,
-                            label=f"{lab} ({role})")
-            if fx is None:
-                ax.axis("off"); continue
-            ax.set_xticks(range(len(fx))); ax.set_xticklabels([f"{v:g}x" for v in fx])
-            ttl = f"{c}\nL{L} feat {info.get('target', ('?',))[0]}"
-            if "control" in info:
-                ttl += f"  ctrl {info['control'][0]}"
-            if "group" in info:
-                ttl += f"  grp n={info['group'][1]}"
-            ax.set_title(ttl, fontsize=9)
-            ax.set_xlabel("steering factor"); ax.set_ylabel("mean next-token CE")
-            ax.grid(ls=":", alpha=0.5)
-            if j == 0:
-                ax.legend(fontsize=6, ncol=3)
-        fig.suptitle("Causal feature steering — next-token CE vs activation scaling "
-                     "(solid=target, dashed=control, dotted=group ablation)", fontsize=10)
-        fig.tight_layout(rect=(0, 0, 1, 0.95))
+                            color=color, label=lab)
+                if fx is None:
+                    ax.axis("off"); continue
+                ax.axhline(0.0, color="0.5", lw=0.8, ls=":")
+                ax.set_xticks(range(len(fx))); ax.set_xticklabels([f"{v:g}x" for v in fx])
+                ax.set_ylabel(f"dCE @ {ptitle.split()[0]}")
+                ax.grid(ls=":", alpha=0.5)
+                if i == 0:
+                    gsz = info.get("group", ("", ""))[1]
+                    ax.set_title(f"{c}  (L{L}, feat {info.get('target', ('?',))[0]}, "
+                                 f"group n={gsz})", fontsize=9)
+                if i == len(posset) - 1:
+                    ax.set_xlabel("steering factor")
+                if i == 0 and j == 0:
+                    ax.legend(fontsize=7)
+        fig.suptitle("Causal feature steering — change in next-token CE vs activation "
+                     "scaling (ablate 0x / identity 1x / amplify 10x)", fontsize=11)
+        fig.tight_layout(rect=(0, 0, 1, 0.96))
         out_png = os.path.join(a.out_dir, "steering_ce.png")
         fig.savefig(out_png, dpi=150)
         print(f"Wrote {out_png}")
